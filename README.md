@@ -38,6 +38,12 @@ All images below were made by this server with the default quality settings. The
 <td><img src="docs/images/transparent.webp" alt="A red fox on a transparent background"><br>
 <b>Transparent background</b></td>
 </tr>
+<tr>
+<td><img src="docs/images/watermark-before.webp" alt="The lighthouse photo covered with a tiled SAMPLE watermark and a corner badge"><br>
+<b>Watermark removal</b>: before (a test watermark added to the first image)</td>
+<td><img src="docs/images/watermark-after.webp" alt="The same photo with the watermark removed"><br>
+<b>Watermark removal</b>: after <code>remove_watermark</code></td>
+</tr>
 </table>
 
 <img src="docs/images/panorama.webp" width="100%" alt="An equirectangular 360 panorama of a mountain meadow"><br>
@@ -85,6 +91,7 @@ repeated 2x2: they all stay seamless.
 | Stone tile | `generate_image`, 512x512, `tileable: true`, seed 512 | A moss-covered stone floor, top-down |
 | Height map | `edit_image` with the stone tile, seed 1 | Convert `<image1>` into a grayscale height map for a game material: white = high stone tops, black = low grout and gaps, keep the exact layout of every stone |
 | Normal map | `edit_image` with the stone tile, seed 2 | Convert `<image1>` into a normal map for a game material, keep the exact layout of every stone |
+| Watermark removal | `remove_watermark`, seed 9, on the text-to-image result with a tiled "SAMPLE" text and a corner badge added | - (no prompt needed) |
 | Upscaling | `upscale_image`, `scale: 4` on the text-to-image result | - |
 
 Characters and brands shown belong to their owners.

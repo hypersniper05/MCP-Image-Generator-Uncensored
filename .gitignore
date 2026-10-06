@@ -1,0 +1,43 @@
+# model weights and generated files
+models/*
+!models/.gitkeep
+outputs/*
+!outputs/.gitkeep
+inputs/*
+!inputs/.gitkeep
+*.gguf
+*.safetensors
+*.onnx
+*.part
+
+# local settings (the start scripts create these from the tracked *.example files)
+.env
+.env.*
+!.env.example
+config.yaml
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+
+# machine-specific compose settings (GPU pinning, resource limits)
+docker-compose.override.yml
+
+# leftovers
+*.bak-*
+*.orig
+*.rej
+smoke_out/

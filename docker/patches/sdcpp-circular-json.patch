@@ -1,0 +1,14 @@
+Read circular, circular_x and circular_y from the sd-server request body, so a single request
+can ask for wrap-around (tileable) output. The CLI already has --circular/--circularx/--circulary.
+--- a/examples/common/common.cpp
++++ b/examples/common/common.cpp
+@@ -2107,6 +2107,9 @@ bool SDGenerationParams::from_json_str(
+ 
+     load_if_exists("increase_ref_index", increase_ref_index);
+     load_if_exists("embed_image_metadata", embed_image_metadata);
++    load_if_exists("circular", circular);
++    load_if_exists("circular_x", circular_x);
++    load_if_exists("circular_y", circular_y);
+ 
+     if (j.contains("hires") && j["hires"].is_object()) {
+         const json& hires_json = j["hires"];

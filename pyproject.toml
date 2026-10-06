@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imagegen-mcp"
+version = "1.0.0"
+description = "Self-hosted MCP server for image generation and editing with the uncensored Qwen-Image-2.1 model"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp==2.3.0",
+    "starlette>=1.7.0",  # used directly by server.py (routes, CORS, file responses)
+    "uvicorn>=0.54.0",
+    "httpx>=0.28.1,<1",  # httpx 1.0 drops AsyncClient, Limits, Timeout and MockTransport
+    "pydantic>=2.13.5",
+    "pyyaml>=6.0.3",
+    "pillow>=12.3.0",
+    "numpy>=2.4",
+    "onnxruntime>=1.30.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=9.1.1", "pytest-asyncio>=1.4.0"]
+
+[project.scripts]
+imagegen-mcp = "imagegen_mcp.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

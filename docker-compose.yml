@@ -1,0 +1,56 @@
+# Image Gen MCP
+#
+# Use the start scripts (./start.sh or .\start.ps1): they read `device:` from
+# config.yaml and start the matching service. Manual equivalent (once: copy
+# config.example.yaml to config.yaml and .env.example to .env; COMPOSE_PROFILES
+# in .env picks gpu or cpu, so later `docker compose logs/restart` match):
+#   docker compose up -d --build
+#
+# Models are stored in ./models, generated images in ./outputs.
+
+x-common: &common
+  restart: unless-stopped
+  ports:
+    - "${MCP_PORT:-5005}:${MCP_PORT:-5005}"
+  volumes:
+    - ./models:/models
+    - ./outputs:/outputs
+    - ./config.yaml:/app/config.yaml:ro
+    - ${INPUTS_DIR:-./inputs}:/inputs:ro
+  environment:
+    HF_TOKEN: ${HF_TOKEN:-}
+    IMAGEGEN_PUBLIC_URL: ${PUBLIC_URL:-}
+    IMAGEGEN_PORT: ${MCP_PORT:-5005}
+  init: true
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "3"
+
+services:
+  imagegen-gpu:
+    <<: *common
+    profiles: ["gpu"]
+    image: ${IMAGE_REPO:-imagegen-mcp}:gpu
+    container_name: imagegen-mcp
+    build:
+      context: .
+      target: gpu
+      args:
+        CUDA_VERSION: ${CUDA_VERSION:-12.8.2}
+        CUDA_ARCHS: ${CUDA_ARCHS:-75-virtual;80-virtual;86-real;89-real;90-virtual;120a-real}
+        BUILD_JOBS: ${BUILD_JOBS:-8}
+    gpus: all
+
+  imagegen-cpu:
+    <<: *common
+    profiles: ["cpu"]
+    image: ${IMAGE_REPO:-imagegen-mcp}:cpu
+    container_name: imagegen-mcp
+    build:
+      context: .
+      target: cpu
+      args:
+        BUILD_JOBS: ${BUILD_JOBS:-8}

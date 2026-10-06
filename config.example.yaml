@@ -1,0 +1,176 @@
+# =============================================================================
+#  Image Gen MCP - configuration
+#  The start scripts copy this file to config.yaml on the first run. Edit config.yaml, not this file.
+#  Changes take effect after a restart: docker compose restart
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Where the model runs: "gpu" (NVIDIA, CUDA) or "cpu".
+# The start scripts read this value and start the matching container.
+# CPU mode works everywhere but is slow (minutes per image); it uses smaller
+# default sizes and fewer steps (see "generation" below).
+# -----------------------------------------------------------------------------
+device: gpu
+
+# -----------------------------------------------------------------------------
+# GPU placement (only used when device: gpu)
+# GPU numbers are the indexes shown by `nvidia-smi` (0, 1, 2, ...).
+# Only the GPUs listed here are made visible to the server, so other GPUs on a
+# shared machine are never touched.
+# Each part can go on a different GPU, or on "cpu":
+#   diffusion        the image model (~4.6 GB Q4_K_M, 5.9 GB Q6_K, 7.6 GB Q8_0)
+#                    list 2+ GPUs to split it across cards, e.g. [0, 1]
+#   text_encoder     Qwen3-VL-8B prompt/image encoder (~5.0 GB at Q4_K_M, plus the 1.2 GB vision file)
+#   vae              image decoder (~0.7 GB weights, several GB while decoding)
+#   background_removal  BiRefNet matte for transparent images ("cpu" is fine)
+# -----------------------------------------------------------------------------
+gpu:
+  diffusion: [0]
+  text_encoder: 0
+  vae: 0                   # the upscaler runs here too
+  background_removal: cpu
+  split_mode: layer        # layer | row  (how diffusion is split when it lists several GPUs)
+  max_vram_gb: {}          # optional memory limit per GPU in GB, e.g. {0: 10}
+  # On a 10-12 GB card, use {text_encoder: cpu}: the text encoder's weights stay in RAM.
+  offload: auto
+                           # auto: fit weights to free VRAM, spill to RAM if needed
+                           # none: keep everything on the GPU (fastest, needs VRAM)
+                           # cpu:  keep weights in RAM, stream to the GPU (low VRAM)
+                           # disk: reload weights from disk on demand (lowest memory)
+  flash_attention: true    # faster and uses less memory
+
+cpu:
+  threads: 0               # engine CPU threads (0 = number of physical cores)
+
+# -----------------------------------------------------------------------------
+# Model files (downloaded automatically into ./models on first start)
+# -----------------------------------------------------------------------------
+model:
+  quant: Q4_K_M            # Q4_K_M (default, 4.6 GB) | Q6_K (5.9 GB) | Q8_0 (7.6 GB)
+                           # also: Q4_0, Q5_K_M, BF16 (14.2 GB)
+  variant: uncensored      # uncensored | base
+  text_encoder_quant: Q4_K_M   # Q4_K_M (5.0 GB) | Q8_0 (8.7 GB) | F16 (16.4 GB)
+  vision_quant: F16        # F16 (1.2 GB) | Q8_0 (0.75 GB) - image understanding for edits
+  vae: texture-fix         # texture-fix: no 2-pixel checkerboard (madebyollin fine-tune) | original: stock VAE
+  auto_download: true
+  verify_checksums: true   # SHA256 check (first start only, cached afterwards)
+  hf_token: ""             # optional Hugging Face token; prefer HF_TOKEN in .env, which git does not track
+
+# -----------------------------------------------------------------------------
+# Network. The server listens on all interfaces (0.0.0.0) with no auth.
+# MCP endpoint: http://<this-machine>:<port>/mcp
+# -----------------------------------------------------------------------------
+server:
+  host: 0.0.0.0
+  port: 5005               # MCP server port. Run the start script again after changing it
+  path: /mcp
+  public_url: ""           # base URL used in returned image links, e.g. http://192.168.1.50:5005
+                           # (empty = http://localhost:<port>)
+  max_request_mb: 64       # max request size (base64 input images)
+  allowed_hosts: []        # empty = accept any Host header. Set e.g. ["192.168.1.50", "myserver"]
+                           # to enable DNS-rebinding protection.
+  log_level: INFO
+
+# -----------------------------------------------------------------------------
+# Generation defaults (tools can override most of these per request)
+# -----------------------------------------------------------------------------
+generation:
+  steps: 40                # GPU default: the official Qwen-Image-2.1 setting, best quality (25 = faster drafts)
+  cpu_steps: 12            # CPU default
+  cfg_scale: 4.0           # text-to-image guidance. 3-5 gives cleaner, more coherent images and legible text and
+                           # enables the negative prompt; 1.0 is 2x faster but hazier (the official, unguided setting)
+  cpu_cfg_scale: 1.0       # CPU default (guidance doubles the time per step)
+  edit_cfg_scale: 4.0      # guidance for edits. Edits need it: at 1.0 the model often ignores the instruction and
+                           # returns an over-sharpened copy of the input. 3-5 works well (2x slower than 1.0).
+  # Built-in negative prompts, applied whenever guidance is above 1. Terms a client passes are added to these.
+  negative_prompt: "blurry, oversaturated, overexposed, high contrast, oversharpened, low quality"
+  edit_negative_prompt: "blurry, oversaturated, overexposed, high contrast, oversharpened, low quality"
+  schedule: official       # official: Qwen-Image-2.1's own noise schedule (much sharper at 2K)
+                           # sdcpp: stable-diffusion.cpp's flux default (shifts too hard at large sizes)
+  sampler: euler
+  scheduler: ""            # empty = model default (ignored with schedule: official)
+  tile_method: auto        # tileable images: circular (seamless in one pass) | repair (older method) | auto
+  recommended_size: xl     # size suggested to the calling model for final images: xl (2K, sharpest) |
+                           # large (~2 MP) | medium (~1 MP, fastest). Use large or medium on slower GPUs.
+  default_size: 1024x1024
+  cpu_default_size: 512x512
+  panorama_size: 2048x1024 # 2880x1440 is the largest 2:1 size within max_megapixels (about 2x slower)
+  cpu_panorama_size: 1024x512
+  max_megapixels: 4.2      # largest allowed output on GPU (2048x2048)
+  cpu_max_megapixels: 1.1  # largest allowed output on CPU
+  ref_max_megapixels: 1.05 # input images for edits are scaled to this size
+  token_budget: 24576      # limits the total size of output + input images per request (bounds memory use)
+  prefix_cache_type: auto  # memory used to speed up edits: auto | f16 | q8_0 (half the memory, for 10-12 GB cards)
+  vae_conv_direct: auto    # lower-memory image decoding: auto | on | off
+  vae_tiling: auto         # decode large images in tiles: auto | on | off
+  vae_tiling_above_megapixels: 1.05
+  vae_tile_size: 1024
+  max_reference_images: 10
+  timeout_seconds: 1800    # stop a generation that runs longer than this (time spent waiting in the queue
+  cpu_timeout_seconds: 7200 # does not count)
+  warmup: true             # run a tiny generation at start so the first request is fast
+  wait_seconds: 50         # how long a tool call waits for its image. Longer jobs return a job_id and
+                           # keep running; clients fetch the result with the get_job tool. Keep this under
+                           # your MCP client's request timeout (many clients stop at 60 s).
+  idle_unload_seconds: 0   # 0 = keep the model loaded. >0: free the GPU memory after this many idle seconds;
+                           # the next request loads it again (about a minute).
+
+# -----------------------------------------------------------------------------
+# Output files (saved in ./outputs, served at http://<host>:<port>/outputs/...)
+# -----------------------------------------------------------------------------
+outputs:
+  format: png              # png | webp | jpeg
+  jpeg_quality: 95
+  inline: auto             # how the image is returned inside the MCP response:
+                           # auto: full image if <= inline_max_bytes, otherwise a preview
+                           # full | preview | none (link only)
+  inline_max_bytes: 700000 # keep under ~750 KB: many MCP clients reject messages over 1 MB
+  preview_max_side: 1024
+  keep_days: 7             # delete outputs older than this (0 = keep forever)
+  embed_metadata: false
+  degrid: true             # remove the faint 2-pixel diamond grid the model's VAE leaves on skin and flat areas
+
+# -----------------------------------------------------------------------------
+# Transparent backgrounds
+#   hybrid: model's native alpha channel, cleaned with a background-removal matte (best)
+#   native: model alpha only        matte: background-removal model only
+# -----------------------------------------------------------------------------
+transparency:
+  method: hybrid
+  threads: 0               # CPU threads for the background-removal model (0 = default)
+  matte_model: birefnet-general-lite   # birefnet-general-lite (224 MB) | birefnet-general (973 MB) | isnet-general-use (179 MB)
+
+# -----------------------------------------------------------------------------
+# 360 panoramas (equirectangular 2:1)
+# -----------------------------------------------------------------------------
+panorama:
+  wrap_method: repair      # how the left and right edges are joined: repair (seam_fix below) | circular | auto
+  seam_fix: true           # repaint the left/right seam with a second pass
+  seam_band_fraction: 0.125
+  seam_strength: 0.6
+  format: jpeg             # jpeg has the widest 360-viewer support
+  embed_gpano: true        # Photo Sphere XMP metadata so viewers detect the 360 image
+
+# -----------------------------------------------------------------------------
+# Watermark removal (the remove_watermark tool)
+# -----------------------------------------------------------------------------
+# Uses a watermark-removal LoRA (80 MB, downloaded on the first start; no commercial use).
+# If the download fails, everything else still works.
+watermark:
+  enabled: true
+  prompt: Remove the watermarks  # the LoRA author's prompt
+  strength: 1.0
+  megapixels: 1.05         # working size; larger images are processed scaled down
+  restore_unchanged: true  # keep the original pixels outside the areas the model changed, at the input's size
+
+# -----------------------------------------------------------------------------
+# Upscaling (the upscale_image tool)
+# -----------------------------------------------------------------------------
+# An ESRGAN super-resolution model, downloaded on the first start.
+# 4xNomos2_otf_esrgan: tuned for photos, 33 MB, CC BY 4.0 (Philip Hofmann).
+# RealESRGAN_x4plus: general purpose, 67 MB, BSD-3-Clause.
+upscale:
+  enabled: true
+  model: 4xNomos2_otf_esrgan
+  tile_size: 128           # input pixels per tile; larger is a little faster and needs more VRAM
+  timeout_seconds: 900     # an upscale that takes longer is stopped

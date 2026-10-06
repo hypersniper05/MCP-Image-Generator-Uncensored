@@ -1,0 +1,9 @@
+# keep the build context small: only pyproject.toml, README.md, src/ and the engine patches are needed
+*
+!pyproject.toml
+!README.md
+!src/
+!docker/patches/
+**/__pycache__
+**/*.pyc
+**/*.egg-info

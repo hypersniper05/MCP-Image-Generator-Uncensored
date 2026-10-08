@@ -157,7 +157,9 @@ def test_upload_and_list(tmp_path):
     buf = io.BytesIO()
     Image.new("RGB", (40, 20), (0, 128, 255)).save(buf, "JPEG")
     with TestClient(app) as client:
-        assert "Upload images" in client.get("/upload").text
+        page = client.get("/upload").text
+        assert "Upload images" in page
+        assert "execCommand('copy')" in page and "isSecureContext" in page  # Copy works on plain-http LAN addresses
         assert "Image Gen MCP" in client.get("/", headers={"Accept": "text/html"}).text
         r = client.post("/upload?name=my photo.jpg", content=buf.getvalue(), headers={"Content-Type": "image/jpeg"})
         res = r.json()

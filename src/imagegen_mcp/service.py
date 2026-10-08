@@ -107,6 +107,14 @@ class PreviewRegistry:
 UPSCALE_MAX_SIDE = 8192  # results stay within sd-server's /sdcpp/v1/upscale limit, per side
 PANORAMA_WRAP_PX = 32  # input columns copied from the opposite edge on each side when upscaling a 360 panorama
 SAVED_CACHE_BYTES = 2 * 1024 * 1024  # results up to this size stay in memory; larger ones are re-read from disk
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")  # files listed and served from outputs/
+
+
+def servable(rel: str) -> bool:
+    """Whether a path under outputs/ is listed and served: an image file outside hidden folders (.previews.json,
+    .stversions/ ...)."""
+    parts = rel.replace("\\", "/").split("/")
+    return not any(p.startswith(".") for p in parts) and Path(parts[-1]).suffix.lower() in IMAGE_SUFFIXES
 
 
 def _is_sphere_file(path: Path) -> bool:
@@ -501,7 +509,19 @@ class ImageService:
     def _finish_rgb(self, img: Image.Image) -> Image.Image:
         # Outputs of the RGBA VAE are 4-channel even for normal prompts; drop the
         # alpha channel unless the image really has transparency.
-        return img.convert("RGB") if not imaging.has_transparency(img) else img
+        return img.convert("RGB") if not imaging.has_transparency(img, output=True) else img
+
+    def _model_rgb(self, src: Image.Image, alpha_in: bool) -> Image.Image:
+        """RGB input for a model that ignores alpha: transparent pixels take the nearest visible colour, so nothing
+        dark bleeds into the edges (unless transparency.hidden_pixels is "keep")."""
+        if alpha_in and self.cfg.transparency.hidden_pixels != "keep":
+            return transparency.visible_rgb(src)
+        return src.convert("RGB")
+
+    @property
+    def _alpha_opts(self) -> dict:
+        t = self.cfg.transparency
+        return {"decontaminate": t.decontaminate, "hidden": t.hidden_pixels}
 
     # ------------------------------------------------------------ operations
     async def generate(self, *, prompt: str, negative_prompt: str = "", width: int | None = None,
@@ -560,7 +580,7 @@ class ImageService:
         if transparent:
             await progress(0.97, "cleaning up the transparent background")
             img, tinfo = await asyncio.to_thread(transparency.apply_transparency, img,
-                                                 self.cfg.transparency.method, self.matter)
+                                                 self.cfg.transparency.method, self.matter, **self._alpha_opts)
             info["transparency"] = tinfo
             if fmt == "jpeg":
                 notes.append("JPEG cannot store transparency, saved as PNG instead")
@@ -631,7 +651,7 @@ class ImageService:
         if transparent:
             await progress(0.97, "cleaning up the transparent background")
             img, tinfo = await asyncio.to_thread(transparency.apply_transparency, img,
-                                                 self.cfg.transparency.method, self.matter)
+                                                 self.cfg.transparency.method, self.matter, **self._alpha_opts)
             info["transparency"] = tinfo
             if fmt == "jpeg":
                 notes.append("JPEG cannot store transparency, saved as PNG instead")
@@ -722,12 +742,15 @@ class ImageService:
             raise ServiceUnavailable("background removal is disabled (transparency.method is 'native')")
         src = await self.loader.load(image)
         await progress(0.3, "running the background-removal model")
-        out = await asyncio.to_thread(transparency.cutout, src, self.matter)
+        out = await asyncio.to_thread(transparency.cutout, src, self.matter, **self._alpha_opts)
+        if icc := imaging.rgb_icc(src):  # the visible pixels are the input's, so keep its colour profile
+            out.info["icc_profile"] = icc
         fmt = "webp" if output_format == "webp" else "png"
         saved = self._save(out, fmt, "cutout")
         return OpResult([saved], {"width": out.width, "height": out.height,
-                                  "alpha": transparency.alpha_stats(out),
-                                  "model": self.cfg.transparency.matte_model}, _input_notes([src]))
+                                  "alpha": transparency.alpha_stats(out), "model": self.cfg.transparency.matte_model,
+                                  "decontaminated": self.cfg.transparency.decontaminate,
+                                  "hidden_pixels": self.cfg.transparency.hidden_pixels}, _input_notes([src]))
 
     async def remove_watermark(self, *, image: str, steps: int | None = None, seed: int | None = None,
                                output_format: str | None = None, progress: Progress = _noop_progress) -> OpResult:
@@ -740,7 +763,8 @@ class ImageService:
         await progress(0.0, "loading the image")
         src = await self.loader.load(image)
         notes = _input_notes([src])
-        rgb = src.convert("RGB")
+        alpha_in = imaging.has_transparency(src)
+        rgb = await asyncio.to_thread(self._model_rgb, src, alpha_in)
         # The model works at about watermark.megapixels whatever the input size; the result goes back to the
         # input's size afterwards.
         target = min(int(wm.megapixels * 1_000_000), self.cfg.max_pixels)
@@ -773,9 +797,9 @@ class ImageService:
         else:
             result = out.resize(rgb.size, Image.Resampling.LANCZOS) if out.size != rgb.size else out
         fmt = (output_format or self.cfg.outputs.format).lower()
-        if imaging.has_transparency(src):  # the model works in RGB; keep the input's alpha channel
-            result = result.convert("RGBA")
-            result.putalpha(src.convert("RGBA").getchannel("A"))
+        if alpha_in:  # the model works in RGB; keep the input's alpha channel
+            result = await asyncio.to_thread(transparency.with_alpha, result, src.convert("RGBA").getchannel("A"),
+                                             hidden=self.cfg.transparency.hidden_pixels)
             if fmt == "jpeg":
                 notes.append("JPEG cannot store transparency, saved as PNG instead")
                 fmt = "png"
@@ -812,7 +836,8 @@ class ImageService:
             notes.append("the image has 360 metadata but is not 2:1, so it was upscaled as a plain image")
         # A seamless tile (tagged by generate_image(tileable=true), or as_tileable) wraps in both directions.
         tile = not pano and (as_tileable if as_tileable is not None else self._is_tile_input(image, src))
-        rgb = src.convert("RGB")
+        alpha_in = imaging.has_transparency(src)
+        rgb = await asyncio.to_thread(self._model_rgb, src, alpha_in)
         target = (src.width * scale, src.height * scale)
         if (longest := max(target)) > UPSCALE_MAX_SIDE:  # integer math: the long side is exactly the limit
             target = (max(1, target[0] * UPSCALE_MAX_SIDE // longest), max(1, target[1] * UPSCALE_MAX_SIDE // longest))
@@ -841,8 +866,7 @@ class ImageService:
             buf = io.BytesIO()
             model_input.save(buf, "PNG", compress_level=1)
             data = await engine.upscale(buf.getvalue(), model=self.upscaler_path,
-                                        tile_size=self.cfg.upscale.tile_size, timeout=timeout,
-                                        wait_limit=self.cfg.timeout_seconds, on_wait=waiting)
+                                        tile_size=self.cfg.upscale.tile_size, timeout=timeout, on_wait=waiting)
         finally:
             self.active_jobs -= 1
         self.jobs_done += 1
@@ -858,8 +882,10 @@ class ImageService:
         if out.size != target:
             out = out.resize(target, Image.Resampling.LANCZOS)
         fmt = (output_format or (self.cfg.panorama.format if pano else self.cfg.outputs.format)).lower()
-        if imaging.has_transparency(src):  # the model is RGB-only: scale the alpha channel separately
-            out.putalpha(src.convert("RGBA").getchannel("A").resize(target, Image.Resampling.LANCZOS))
+        if alpha_in:  # the model is RGB-only: scale the alpha channel separately
+            alpha = src.convert("RGBA").getchannel("A").resize(target, Image.Resampling.LANCZOS)
+            out = await asyncio.to_thread(transparency.with_alpha, out, alpha,
+                                          hidden=self.cfg.transparency.hidden_pixels)
             if fmt == "jpeg":
                 notes.append("JPEG cannot store transparency, saved as PNG instead")
                 fmt = "png"
@@ -932,8 +958,8 @@ class ImageService:
             if not root.exists():
                 return out
             for p in root.rglob("*"):
-                if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
-                    rel = p.relative_to(root).as_posix()
+                rel = p.relative_to(root).as_posix()
+                if servable(rel) and p.is_file():
                     st = p.stat()
                     out.append({"file": f"{prefix}{rel}", "url": f"{url_base}/{rel}" if url_base else None,
                                 "bytes": st.st_size, "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc)
@@ -966,6 +992,7 @@ class ImageService:
             "download": self.store.status.as_dict(),
             "engine": e.state if e else "not started",
             "engine_progress": vars(e.progress) if e else None,
+            "queue": e.queue.snapshot() if e and hasattr(e, "queue") else None,
             "background_removal": ({"model": self.cfg.transparency.matte_model, "provider": self.matter.provider}
                                    if self.matter else None),
             "upscale": ("disabled" if not self.cfg.upscale.enabled else

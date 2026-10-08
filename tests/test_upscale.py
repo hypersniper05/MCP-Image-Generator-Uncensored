@@ -158,30 +158,27 @@ async def test_engine_upscale_failure_and_timeout(monkeypatch, tmp_path):
     e, procs = _engine_with_cli(monkeypatch, delay=5)
     with pytest.raises(EngineError, match="did not finish in 1 s"):
         await e.upscale(b"png", model=tmp_path / "m.safetensors", tile_size=128, timeout=1)
-    assert procs[0].killed and not e._upscale_lock.locked()
+    assert procs[0].killed and not e.queue.turns
 
 
-async def test_upscale_waits_for_running_generations(monkeypatch, tmp_path):
+async def test_upscale_waits_for_its_turn(monkeypatch, tmp_path):
     import asyncio
     e, procs = _engine_with_cli(monkeypatch)
-    e._gen_active = 1
     waits = []
 
     async def on_wait(msg):
         waits.append(msg)
 
-    async def finish_generation():
-        await asyncio.sleep(1.2)
-        assert not procs  # nothing ran while the generation was active
-        e._gen_active = 0
+    async def generation_holds_the_card():
+        async with e.queue.turn("generate", 60.0):
+            await asyncio.sleep(2.5)
+            assert not procs  # nothing ran while the generation had the card
 
-    task = asyncio.create_task(finish_generation())
-    await e.upscale(b"png", model=tmp_path / "m.safetensors", tile_size=128, timeout=60, on_wait=on_wait)
+    task = asyncio.create_task(generation_holds_the_card())
+    await asyncio.sleep(0)
+    await e.upscale(b"png", model=tmp_path / "m.safetensors", tile_size=128, timeout=1, on_wait=on_wait)
     await task
-    assert procs and waits
-    e._gen_active = 1
-    with pytest.raises(EngineError, match="busy with other images"):
-        await e.upscale(b"png", model=tmp_path / "m.safetensors", tile_size=128, timeout=60, wait_limit=1)
+    assert procs and waits[0].startswith("queued: position 1 in line, starts in about 60 s")
 
 
 def test_sd_server_never_gets_an_upscaler(tmp_path):
@@ -262,7 +259,7 @@ async def test_generation_and_upscale_never_overlap(monkeypatch, tmp_path):
         await asyncio.gather(first(), second())
         (g0, g1), (u0, u1) = spans["gen"][0], spans["up"][0]
         assert g1 <= u0 or u1 <= g0, (first.__name__, spans)
-    assert e._gen_active == 0 and e._active == 0 and not e._upscale_lock.locked()
+    assert e._active == 0 and not e.queue.turns
 
 
 

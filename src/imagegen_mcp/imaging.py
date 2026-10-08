@@ -357,11 +357,14 @@ def normalize_mask(img: Image.Image, size: tuple[int, int]) -> Image.Image:
     return gray.point(lambda v: 255 if v >= 128 else 0).convert("RGB")
 
 
-def has_transparency(img: Image.Image) -> bool:
+def has_transparency(img: Image.Image, *, output: bool = False) -> bool:
+    """True when the image really uses its alpha channel: at least 0.1% of its pixels are below 250, or (for an
+    input image) any pixel is below 240. The RGBA VAE leaves a few nearly opaque pixels in normal images (1-18 seen
+    at 240-249); those do not count in outputs."""
     if img.mode != "RGBA":
         return False
-    lo, _ = img.getchannel("A").getextrema()
-    return lo < 250
+    a = np.asarray(img.getchannel("A"))
+    return bool((a < 250).mean() >= 0.001 or (not output and (a < 240).any()))
 
 
 def flatten(img: Image.Image, color=(255, 255, 255)) -> Image.Image:
@@ -404,7 +407,9 @@ def degrid(img: Image.Image, bandwidth: float = 0.045, pad: int = 32,
     return result
 
 
-def encode(img: Image.Image, fmt: str, *, quality: int = 95, xmp: bytes | None = None) -> bytes:
+def encode(img: Image.Image, fmt: str, *, quality: int = 95, xmp: bytes | None = None,
+           lossless: bool | None = None) -> bytes:
+    """lossless (WebP): None = automatic, lossless when the image has transparency (exact edge colours)."""
     buf = io.BytesIO()
     fmt = fmt.lower()
     icc = img.info.get("icc_profile")  # PNG keeps it from img.info on its own; JPEG and WebP need it passed
@@ -417,6 +422,10 @@ def encode(img: Image.Image, fmt: str, *, quality: int = 95, xmp: bytes | None =
         flatten(img).save(buf, "JPEG", **kw)
     elif fmt == "webp":
         kw = {"quality": quality, "method": 4}
+        if lossless is None:  # transparent: lossless, so the edge colours stay exact (still smaller than a PNG)
+            lossless = img.mode == "RGBA" and img.getchannel("A").getextrema()[0] < 255
+        if lossless:
+            kw = {"lossless": True, "quality": 80, "method": 4, "exact": True}
         if xmp:
             kw["xmp"] = xmp
         if icc:
@@ -450,5 +459,5 @@ def preview(img: Image.Image, max_side: int, keep_alpha: bool) -> tuple[bytes, s
     im = img.copy()
     im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     if keep_alpha and im.mode == "RGBA":
-        return encode(im, "webp", quality=85), "image/webp"
+        return encode(im, "webp", quality=85, lossless=False), "image/webp"
     return encode(im, "jpeg", quality=85), "image/jpeg"

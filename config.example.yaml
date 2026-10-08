@@ -137,8 +137,10 @@ outputs:
 # -----------------------------------------------------------------------------
 transparency:
   method: hybrid
-  threads: 0               # CPU threads for the background-removal model (0 = default)
+  threads: 0               # CPU threads for the background-removal model (0 = half the container's CPUs, max 8)
   matte_model: birefnet-general-lite   # birefnet-general-lite (224 MB) | birefnet-general (973 MB) | isnet-general-use (179 MB)
+  decontaminate: true      # clean edge colours, so the old background does not tint the edge of a cut-out
+  hidden_pixels: black     # fully transparent pixels: black (smallest file) | edge (nearest visible colour) | keep
 
 # -----------------------------------------------------------------------------
 # 360 panoramas (equirectangular 2:1)

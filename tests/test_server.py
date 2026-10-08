@@ -99,6 +99,58 @@ def test_http_routes_and_host_header(tmp_path):
         assert r.status_code != 421
 
 
+def test_outputs_serve_images_only(tmp_path):
+    svc = StubService(_cfg(tmp_path), tmp_path)
+    (tmp_path / "2026-01-01").mkdir()
+    (tmp_path / ".hidden").mkdir()
+    Image.new("RGB", (8, 8)).save(tmp_path / "2026-01-01" / "a.png")
+    Image.new("RGB", (8, 8)).save(tmp_path / ".hidden" / "b.png")
+    (tmp_path / ".previews.json").write_text("{}")
+    (tmp_path / "cleanup-manifest-20261006.txt").write_text("x")
+    _, app = build_app(svc)
+    with TestClient(app) as client:
+        assert client.get("/outputs/2026-01-01/a.png").status_code == 200
+        for bad in (".previews.json", "cleanup-manifest-20261006.txt", ".hidden/b.png", "2026-01-01",
+                    "2026-01-01/../.previews.json", "2026-01-01/a.png%00", "2026-01-01/%2e%2e/.previews.json",
+                    "a/" * 2100 + "x.png"):
+            assert client.get("/outputs/" + bad).status_code == 404, bad
+            assert client.get("/view/" + bad).status_code == 404, bad
+        listed = [e["file"] for e in client.get("/api/images").json()["outputs_and_uploads"]]
+        assert listed == ["2026-01-01/a.png"]  # nothing from hidden folders
+
+
+async def test_view_image_links_only_served_files(tmp_path):
+    svc = StubService(_cfg(tmp_path), tmp_path)
+    mcp = create_server(svc)
+    (tmp_path / ".hidden").mkdir()
+    Image.new("RGB", (8, 8)).save(tmp_path / ".hidden" / "b.png")
+    (tmp_path / "2026-01-01").mkdir()
+    Image.new("RGB", (8, 8)).save(tmp_path / "2026-01-01" / "a.png")
+    shown = await mcp.call_tool("view_image", {"image": "2026-01-01/a.png"})
+    assert shown.structured_content["url"].endswith("/outputs/2026-01-01/a.png")
+    hidden = await mcp.call_tool("view_image", {"image": ".hidden/b.png"})
+    assert hidden.is_error or "url" not in hidden.structured_content
+
+
+def test_list_images_links_follow_the_client_host(tmp_path):
+    import json
+    svc = StubService(_cfg(tmp_path), tmp_path)
+    (tmp_path / "2026-01-01").mkdir()
+    Image.new("RGB", (8, 8)).save(tmp_path / "2026-01-01" / "a.png")
+    _, app = build_app(svc)
+    with TestClient(app) as client:
+        r = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                      "params": {"name": "list_images", "arguments": {}}},
+                        headers={"Accept": "application/json, text/event-stream", "Host": "198.51.100.7:5005",
+                                 "MCP-Protocol-Version": "2025-06-18"})
+    lines = [ln[5:] for ln in r.text.splitlines() if ln.startswith("data:")] or [r.text]
+    result = json.loads(lines[-1])["result"]
+    assert not result.get("isError"), result
+    listing = result.get("structuredContent") or json.loads(result["content"][0]["text"])
+    urls = [e["url"] for e in listing.get("result", listing)["outputs_and_uploads"]]
+    assert urls == ["http://198.51.100.7:5005/outputs/2026-01-01/a.png"]
+
+
 def test_upload_and_list(tmp_path):
     svc = StubService(_cfg(tmp_path), tmp_path)
     _, app = build_app(svc)

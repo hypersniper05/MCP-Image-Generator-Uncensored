@@ -209,8 +209,9 @@ The endpoint is `http://<host>:5005/mcp` (Streamable HTTP).
 { "mcpServers": { "imagegen": { "command": "npx", "args": ["-y", "mcp-remote", "http://localhost:5005/mcp", "--allow-http"] } } }
 ```
 
-Large images take minutes. If an image is not ready within 50 seconds, the tool returns a `job_id` and the
-client gets the image later with `get_job`, so clients with short timeouts still work.
+Large images take minutes. If an image is not ready within 25 seconds, the tool returns a `job_id` and the
+client gets the image with `get_job`, so clients with short time limits still work. To wait longer per call, add
+`?max_wait=N` to the endpoint URL (in seconds, at most 280; keep it under your client's tool time limit).
 
 <details>
 <summary>llama.cpp web UI and optional request headers</summary>
@@ -228,7 +229,7 @@ Optional headers a client can send:
 
 | Header | Effect |
 |---|---|
-| `X-Imagegen-Max-Wait: 20` | Wait at most this many seconds before returning a `job_id` |
+| `X-Imagegen-Max-Wait: 20` | How long a call waits before returning a `job_id` (default 25, at most 280); the same as `?max_wait=N` |
 | `X-Inline-Max-Bytes: 16000000` | Send the full image inline instead of a preview (for clients without a message size limit) |
 | `X-Imagegen-Inline: data-uri-text` | Return images as data-URI text, for clients that drop MCP image content |
 | `X-Forwarded-Host: 192.168.1.50:5005` | Host name to use in returned links when the client connects through a proxy |
@@ -276,7 +277,7 @@ Restart after a change: `docker compose restart`. The most useful ones:
 | `generation.steps` | 40 | Quality vs. speed. 25 is a faster draft |
 | `generation.default_size` | 1024x1024 | Size when a request gives none |
 | `generation.panorama_size` | 2048x1024 | Default panorama size (2880x1440 at most) |
-| `generation.wait_seconds` | 50 | How long a tool waits before returning a `job_id` |
+| `generation.wait_seconds` | 25 | How long a tool call (and each `get_job`) waits before returning a `job_id` (at most 280) |
 | `generation.idle_unload_seconds` | 0 | Free the GPU memory after this many idle seconds (0 = keep loaded) |
 | `outputs.keep_days` | 7 | Delete old results after this many days (0 = never) |
 | `server.port` | 5005 | Port of the server |
@@ -308,7 +309,7 @@ On a shared computer, only the GPUs you list are used. For cards with less memor
   Container Toolkit. Or use `device: cpu`.
 - **Out of GPU memory**: use the [12 GB settings](#gpu-memory), a smaller size, or move the text encoder to
   another GPU.
-- **The client times out**: lower `generation.wait_seconds` below the client's timeout.
+- **The client times out**: add `?max_wait=N` to the endpoint URL (or lower `generation.wait_seconds`) with N below the client's tool time limit.
 - **Other computers cannot connect**: use this computer's IP address instead of `localhost`, allow port 5005
   in the firewall, and set `server.public_url` so image links work.
 - **CPU mode is very slow or crashes on Windows**: Docker Desktop gives WSL only half your RAM. Raise it in

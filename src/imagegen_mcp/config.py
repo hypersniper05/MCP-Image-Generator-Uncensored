@@ -174,7 +174,7 @@ class GenerationConfig(_Section):
     timeout_seconds: int = Field(1800, ge=30)
     cpu_timeout_seconds: int = Field(7200, ge=30)
     warmup: bool = True
-    wait_seconds: int = Field(50, ge=0, le=3600)
+    wait_seconds: int = Field(25, ge=0, le=3600)  # values above 280 are capped at run time (server.MAX_WAIT_LIMIT)
     # Stop the inference engine after this many seconds with no job, freeing all of its VRAM; the next
     # request starts it again (costs one engine load). 0 = keep it loaded forever.
     idle_unload_seconds: int = Field(0, ge=0)

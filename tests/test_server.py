@@ -37,7 +37,9 @@ async def test_tools_are_registered_with_schemas(tmp_path):
     mcp = create_server(StubService(_cfg(tmp_path), tmp_path))
     tools = {t.name: t for t in await mcp.list_tools()}
     assert set(tools) == {"generate_image", "edit_image", "generate_panorama", "remove_background", "server_status",
-                          "get_job", "cancel_job", "list_images", "view_image", "remove_watermark", "upscale_image"}
+                          "get_job", "cancel_job", "list_images", "view_image", "remove_watermark", "upscale_image",
+                          "job_status"}  # job_status: used by the in-chat viewer only
+    assert "wait_seconds" not in tools["generate_image"].input_schema["properties"]  # the server sets the wait
     assert tools["remove_watermark"].input_schema["required"] == ["image"]
     gen = tools["generate_image"].input_schema
     assert "prompt" in gen["required"]
@@ -59,15 +61,18 @@ async def test_generate_returns_image_and_link(tmp_path):
 
 
 async def test_slow_job_returns_job_id_then_get_job_returns_image(tmp_path):
-    svc = StubService(_cfg(tmp_path), tmp_path)
+    cfg = Config.model_validate({"outputs_dir": str(tmp_path), "models_dir": str(tmp_path / "m"),
+                                 "generation": {"wait_seconds": 0}})
+    svc = StubService(cfg, tmp_path)
     svc.delay = 0.6
     mcp = create_server(svc)
-    first = await mcp.call_tool("generate_image", {"prompt": "red", "wait_seconds": 0})
+    first = await mcp.call_tool("generate_image", {"prompt": "red"})
     assert not first.is_error and first.content[0].type == "text"
     job_id = first.structured_content["job_id"]
     assert first.structured_content["status"] == "running"
     assert "get_job" in first.content[0].text
-    done = await mcp.call_tool("get_job", {"job_id": job_id, "wait_seconds": 5})
+    svc.cfg.generation.wait_seconds = 5
+    done = await mcp.call_tool("get_job", {"job_id": job_id})
     assert [c.type for c in done.content] == ["image", "text"]
     missing = await mcp.call_tool("get_job", {"job_id": "nope"})
     assert missing.is_error
@@ -280,7 +285,7 @@ async def test_tool_descriptions_carry_the_configured_guidance(tmp_path):
     tools = {t.name: t for t in await mcp.list_tools()}
     gen = tools["generate_image"].description
     assert '"blurry, low quality"' in gen and "leave unset (3.5" in gen and 'pass size="xl"' in gen
-    assert "omit seed (never pass the earlier seed)" in gen and '"Still working"' in gen
+    assert "omit seed (never pass the earlier seed)" in gen and '"Not finished yet"' in gen
     edit = tools["edit_image"].description
     assert "keep everything else unchanged" in edit and "Never reuse the seed" in edit
     assert "every direction" in tools["generate_panorama"].description

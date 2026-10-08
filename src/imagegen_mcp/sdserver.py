@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import contextlib
 import functools
 import logging
 import os
@@ -56,6 +57,110 @@ class EngineProgress:
     updated: float = field(default_factory=time.monotonic)
 
 
+@dataclass(eq=False)
+class Turn:
+    kind: str                 # generate | upscale
+    estimate: float           # expected time on the card, in seconds
+    ready: asyncio.Future
+    started: float | None = None
+    settle: Awaitable | None = None  # set when the engine is still finishing work this job abandoned
+
+
+def _about(seconds: float) -> str:
+    if seconds < 90:
+        return f"about {max(10, int(round(seconds / 10)) * 10)} s"
+    return f"about {int(round(seconds / 60))} min"
+
+
+class GpuQueue:
+    """Engine jobs (generations and upscales) take turns on the card one at a time, in arrival order. A job's
+    timeout starts with its turn, so a long queue never fails it; while it waits it reports its place in line
+    and a rough start time, so clients can tell waiting from stuck."""
+
+    def __init__(self, remaining: Callable[[Turn, float], float] | None = None):
+        self.turns: collections.deque[Turn] = collections.deque()  # turns[0] has the card
+        self.remaining = remaining or (lambda t, now: max(0.0, t.estimate - (now - (t.started or now))))
+        self._settling: set[asyncio.Task] = set()
+        self._moved: asyncio.Future | None = None  # resolved whenever the line moves, so waiters report at once
+
+    @contextlib.asynccontextmanager
+    async def turn(self, kind: str, estimate: float, on_wait: Callable[[str], Awaitable[None]] | None = None):
+        loop = asyncio.get_running_loop()
+        t = Turn(kind, estimate, loop.create_future())
+        self.turns.append(t)
+        if self.turns[0] is t:
+            t.ready.set_result(None)
+        try:
+            while not t.ready.done():
+                if on_wait:
+                    await on_wait(self.describe(t))
+                if self._moved is None or self._moved.done():
+                    self._moved = loop.create_future()
+                await asyncio.wait([t.ready, self._moved], timeout=2.0, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            self._leave(t)
+            raise
+        t.started = time.monotonic()
+        try:
+            yield t
+        finally:
+            if t.settle is None:
+                self._leave(t)
+            else:  # keep the card until the engine has really stopped, so the next job never shares it
+                task = asyncio.create_task(self._leave_after(t))
+                self._settling.add(task)
+                task.add_done_callback(self._settling.discard)
+
+    async def _leave_after(self, t: Turn) -> None:
+        try:
+            await t.settle
+        except Exception:  # noqa: BLE001 - only the wait matters
+            pass
+        finally:
+            self._leave(t)
+
+    def _leave(self, t: Turn) -> None:
+        head = bool(self.turns) and self.turns[0] is t
+        with contextlib.suppress(ValueError):
+            self.turns.remove(t)
+        if head and self.turns and not self.turns[0].ready.done():
+            self.turns[0].ready.set_result(None)
+        if self._moved is not None and not self._moved.done():
+            self._moved.set_result(None)
+
+    def wait_for(self, t: Turn) -> tuple[int, float]:
+        """(place in line, 1 = next; rough seconds until t starts)."""
+        now, place, secs = time.monotonic(), 0, 0.0
+        for other in self.turns:
+            if other is t:
+                break
+            place += 1
+            secs += self.remaining(other, now) if other.started is not None else other.estimate
+        return place, secs
+
+    def describe(self, t: Turn) -> str:
+        place, secs = self.wait_for(t)
+        return f"queued: position {place} in line, starts in {_about(secs)}"
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        head = self.turns[0] if self.turns and self.turns[0].started is not None else None
+        return {"running": head.kind if head else None,
+                "waiting": len(self.turns) - (1 if head else 0),
+                "drain_eta_s": int(sum(self.remaining(t, now) if t.started is not None else t.estimate
+                                       for t in self.turns))}
+
+
+def _ema(old: float, new: float) -> float:
+    return 0.7 * old + 0.3 * new
+
+
+def _png_megapixels(data: bytes) -> float:
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big") * int.from_bytes(data[20:24], "big") / 1e6
+    return 1.0
+
+
 class SdServer:
     def __init__(self, cfg: Config, plan: DevicePlan, model_paths: dict[str, Path]):
         self.cfg = cfg
@@ -79,12 +184,16 @@ class SdServer:
         self._restarts = 0
         self._stopping = False
         self._restart_lock = asyncio.Lock()
+        self._start_task: asyncio.Task | None = None  # an on-demand (re)start, shielded from job cancels
         # Idle unload: stop the engine (state "unloaded") after this long with no job; ensure_running()
         # starts it again on the next request. 0 disables it.
         self.idle_unload_seconds = cfg.generation.idle_unload_seconds
-        self._active = 0                      # jobs currently inside generate() or upscale()
-        self._gen_active = 0                  # generations submitted to sd-server and not finished
-        self._upscale_lock = asyncio.Lock()   # held while sd-cli upscales; generations wait for it
+        self._active = 0                      # generations queued or running
+        self.queue = GpuQueue(self._remaining)
+        # Learned speeds for queue ETAs: seconds per (step x megapixel) of a generation (output plus references),
+        # and seconds per input megapixel of a 4x upscale.
+        self._gen_rate = 2.5
+        self._up_rate = 20.0
         self._last_active = time.monotonic()
         self._idle_task: asyncio.Task | None = None
 
@@ -244,27 +353,51 @@ class SdServer:
         self.state = "stopped"
         await self._client.aclose()
 
+    def _alive(self) -> bool:
+        return self.state == "ready" and self.proc is not None and self.proc.returncode is None
+
     async def ensure_running(self) -> None:
-        if self.state == "ready" and self.proc and self.proc.returncode is None:
+        """Make sure sd-server is up: reload it after an idle unload, restart it after a crash. The (re)start runs
+        as its own task, so a job cancelled while it waits never leaves the engine half-started."""
+        if self._alive():
             return
         async with self._restart_lock:
-            if self.state == "ready" and self.proc and self.proc.returncode is None:
+            if self._alive():
                 return
-            if self.state == "unloaded":
-                log.info("reloading sd-server on demand (was unloaded after %ss idle)", self.idle_unload_seconds)
-                t = time.monotonic()
-                await self.start()
-                log.info("sd-server reloaded in %.1f s", time.monotonic() - t)
-                return
-            if self.state == "crashed":
-                self._restarts += 1
-                wait = min(30, 2 ** min(self._restarts, 5))
-                log.warning("restarting sd-server in %ss (restart #%d)", wait, self._restarts)
-                await asyncio.sleep(wait)
-                await self.start()
-                return
-        if self.state != "ready":
-            raise EngineError(f"inference engine is {self.state}")
+            if self._start_task is None or self._start_task.done():
+                if self.state in ("ready", "starting") and (self.proc is None or self.proc.returncode is not None
+                                                            or self._start_task is not None):
+                    # the process died before _read_output noticed, or an earlier start failed or never got ready
+                    await self._kill()
+                    self.state = "crashed"
+                if self.state == "unloaded":
+                    log.info("reloading sd-server on demand (was unloaded after %ss idle)", self.idle_unload_seconds)
+                    self._start_task = self._spawn_start(0.0, "reloaded")
+                elif self.state == "crashed":
+                    self._restarts += 1
+                    wait = min(30, 2 ** min(self._restarts, 5))
+                    log.warning("restarting sd-server in %ss (restart #%d)", wait, self._restarts)
+                    self._start_task = self._spawn_start(wait, "restarted")
+                else:
+                    raise EngineError(f"inference engine is {self.state}")
+            await asyncio.shield(self._start_task)
+
+    def _spawn_start(self, delay: float, verb: str) -> asyncio.Task:
+        async def run() -> None:
+            await asyncio.sleep(delay)
+            t = time.monotonic()
+            await self.start()
+            log.info("sd-server %s in %.1f s", verb, time.monotonic() - t)
+
+        task = asyncio.create_task(run(), name="sd-server-start")
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())  # the waiting job reports any error
+        return task
+
+    async def _kill(self) -> None:
+        if self.proc is not None and self.proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self.proc.kill()
+            await self.proc.wait()
 
     # ------------------------------------------------------------------ idle unload
     def start_idle_watch(self) -> None:
@@ -319,34 +452,33 @@ class SdServer:
         raise AssertionError("unreachable")
 
     async def generate(self, body: dict, *, timeout: float, on_progress: ProgressCallback | None = None) -> list[bytes]:
-        """Submit a native img_gen job and wait for the resulting PNG bytes."""
+        """Submit a native img_gen job when its turn on the card comes, and wait for the resulting PNG bytes.
+        ``timeout`` counts from the start of the turn, never the wait in the queue."""
         self._active += 1                     # counted before ensure_running(), so unload() sees it
-        self._gen_active += 1
+
+        async def waiting(msg: str) -> None:
+            if on_progress:
+                await on_progress(0.0, msg)
+
         try:
-            return await self._generate(body, timeout=timeout, on_progress=on_progress)
+            async with self.queue.turn("generate", self._gen_estimate(body), waiting) as turn:
+                return await self._generate(body, timeout=timeout, on_progress=on_progress, turn=turn)
         except httpx.HTTPError as exc:
             raise EngineError(f"lost the connection to the inference engine ({exc.__class__.__name__}: {exc})") \
                 from exc
         finally:
             self._active -= 1
-            self._gen_active -= 1
             self._last_active = time.monotonic()  # the idle clock starts when the job ends
 
     async def upscale(self, image_png: bytes, *, model: Path, tile_size: int, timeout: float,
-                      wait_limit: float = 3600.0, on_wait: ProgressCallback | None = None) -> bytes:
+                      on_wait: Callable[[str], Awaitable[None]] | None = None) -> bytes:
         """Upscale a PNG with an ESRGAN model by running sd-cli (-M upscale) as a short-lived process on the VAE's
-        device: it loads the 33-67 MB model, upscales and exits, so nothing stays in VRAM. It first waits (up to
-        wait_limit) for running generations, and new generations wait for it, so the two never share the card;
-        ``timeout`` covers only the upscale, and the process is killed when it runs out."""
-        async with self._upscale_lock:
-            waited = 0.0
-            while self._gen_active > 0:
-                if waited >= wait_limit:
-                    raise EngineError(f"the engine was busy with other images for {int(wait_limit)} s; try again later")
-                if on_wait and waited % 5 < 0.5:
-                    await on_wait("waiting for the running image job to finish")
-                await asyncio.sleep(0.5)
-                waited += 0.5
+        device: it loads the 33-67 MB model, upscales and exits, so nothing stays in VRAM. It waits for its turn
+        in the same queue as generations, so the two never share the card; ``timeout`` covers only the upscale,
+        and the process is killed when it runs out."""
+        mp = _png_megapixels(image_png)
+        async with self.queue.turn("upscale", 3.0 + self._up_rate * mp, on_wait) as turn:
+            t0 = time.monotonic()
             with tempfile.TemporaryDirectory(prefix="imagegen-upscale-") as d:
                 src, dst = Path(d) / "in.png", Path(d) / "out.png"
                 src.write_bytes(image_png)
@@ -362,16 +494,84 @@ class SdServer:
                     proc.kill()
                     await proc.wait()
                     raise EngineError(f"the upscale did not finish in {int(timeout)} s and was stopped") from None
+                except BaseException:  # cancelled: stop sd-cli, and keep the card until it has really exited
+                    if proc.returncode is None:
+                        with contextlib.suppress(ProcessLookupError):
+                            proc.kill()
+                        turn.settle = proc.wait()
+                    raise
                 if proc.returncode != 0 or not dst.exists():
                     tail = " | ".join(out.decode("utf-8", "replace").strip().splitlines()[-3:])
                     raise EngineError(f"the upscaler failed (exit code {proc.returncode}): {tail[:400]}")
+                self._up_rate = _ema(self._up_rate, (time.monotonic() - t0) / max(mp, 0.01))
                 return dst.read_bytes()
 
-    async def _generate(self, body: dict, *, timeout: float, on_progress: ProgressCallback | None) -> list[bytes]:
-        while self._upscale_lock.locked():  # never share the card with a running upscale
-            await asyncio.sleep(0.5)
-        await self.ensure_running()
-        r = await self._client.post("/sdcpp/v1/img_gen", json=body)
+    # ------------------------------------------------------------------ queue estimates
+    def _gen_size(self, body: dict) -> tuple[int, float]:
+        """(steps, megapixels the model attends over: output plus references)."""
+        steps = int((body.get("sample_params") or {}).get("sample_steps") or self.cfg.default_steps)
+        mp = int(body.get("width") or 1024) * int(body.get("height") or 1024) / 1e6
+        mp += len(body.get("ref_images") or []) * self.cfg.generation.ref_max_megapixels
+        return steps, mp
+
+    def _gen_estimate(self, body: dict) -> float:
+        steps, mp = self._gen_size(body)
+        return 5.0 + self._gen_rate * steps * mp
+
+    def _remaining(self, t: Turn, now: float) -> float:
+        """Rough seconds left for the job that has the card: from the live step timing when it is denoising."""
+        p = self.progress
+        if (t.kind == "generate" and p.phase == "sampling" and p.total and p.sec_per_step
+                and t.started is not None and p.updated >= t.started):
+            return (p.total - p.step) * p.sec_per_step + 5.0
+        return max(0.0, t.estimate - (now - (t.started or now)))
+
+    async def _drop_posted(self, post: asyncio.Future, limit: float) -> None:
+        """A job was cancelled while its request was on the way: if sd-server took it, cancel it there and wait until
+        it stops."""
+        try:
+            r = await asyncio.wait_for(post, 60.0)
+            job_id = r.json().get("id") if r.status_code < 400 else None
+        except Exception:  # noqa: BLE001 - the request failed: there is no job to drop
+            return
+        if job_id:
+            await self._drop(job_id, limit)
+
+    async def _drop(self, job_id: str, limit: float) -> None:
+        """Cancel an abandoned job in sd-server, then wait until it stops."""
+        with contextlib.suppress(Exception):
+            await self._client.post(f"/sdcpp/v1/jobs/{job_id}/cancel", timeout=5.0)
+        await self._settle(job_id, limit)
+
+    async def _settle(self, job_id: str, limit: float) -> None:
+        """Wait until sd-server stops working on an abandoned job: one it already started finishes even when
+        cancelled, and the next job must not share the card with it."""
+        end = time.monotonic() + limit
+        while time.monotonic() < end and self.proc is not None and self.proc.returncode is None:
+            try:
+                jr = await self._get(f"/sdcpp/v1/jobs/{job_id}")
+                if jr.status_code != 200 or jr.json().get("status") in ("completed", "failed", "cancelled"):
+                    return
+            except (httpx.HTTPError, ValueError):
+                return
+            await asyncio.sleep(1.0)
+
+    async def _generate(self, body: dict, *, timeout: float, on_progress: ProgressCallback | None,
+                        turn: Turn | None = None) -> list[bytes]:
+        try:
+            await self.ensure_running()
+        except asyncio.CancelledError:
+            start = self._start_task
+            if turn is not None and start is not None and not start.done():  # the (re)load goes on: keep the card
+                turn.settle = asyncio.shield(start)
+            raise
+        post = asyncio.ensure_future(self._client.post("/sdcpp/v1/img_gen", json=body))
+        try:
+            r = await asyncio.shield(post)
+        except asyncio.CancelledError:
+            if turn is not None:  # sd-server may take the job anyway: drop it and keep the card until it stops
+                turn.settle = self._drop_posted(post, timeout)
+            raise
         if r.status_code == 429:
             raise EngineError("the generation queue is full, try again later")
         if r.status_code >= 400:
@@ -392,10 +592,16 @@ class SdServer:
                     raise EngineError(f"job status HTTP {jr.status_code}: {jr.text[:300]}")
                 j = jr.json()
                 status = j.get("status")
+                if status in ("completed", "failed", "cancelled"):
+                    job_id = None  # finished: nothing to cancel or wait for
                 if status == "completed":
                     images = (j.get("result") or {}).get("images") or []
                     if not images:
                         raise EngineError("the job completed without images")
+                    self._restarts = 0  # the engine works again: the next crash restarts without a long wait
+                    steps, mp = self._gen_size(body)
+                    if started is not None and steps >= 8:
+                        self._gen_rate = _ema(self._gen_rate, max(0.0, time.monotonic() - started - 5.0) / (steps * mp))
                     return [base64.b64decode(img["b64_json"]) for img in images]
                 if status in ("failed", "cancelled"):
                     err = j.get("error") or {}
@@ -414,12 +620,11 @@ class SdServer:
                     last_report = now
                     await on_progress(*self._describe(status, j))
                 await asyncio.sleep(0.5)
-        except (asyncio.CancelledError, EngineError):
-            # The client went away or we gave up: drop the job if it is still queued.
-            try:
-                await self._client.post(f"/sdcpp/v1/jobs/{job_id}/cancel", timeout=5.0)
-            except Exception:  # noqa: BLE001
-                pass
+        except BaseException:
+            # The client went away, we gave up or the engine stopped answering: drop the job, and hold the card until
+            # the engine lets go of it. No await here, so a second cancel cannot skip this.
+            if job_id is not None and turn is not None:
+                turn.settle = self._drop(job_id, timeout)
             raise
 
     def _describe(self, status: str, job: dict) -> tuple[float, str]:

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from types import SimpleNamespace
 
@@ -61,7 +62,8 @@ async def test_running_time_is_limited(monkeypatch):
     e = _engine(monkeypatch, ["queued"] * 3 + ["generating"] * 30)
     with pytest.raises(EngineError, match="timed out after 100 s"):
         await e.generate({}, timeout=100)
-    assert e.cancelled
+    await asyncio.gather(*e.queue._settling)  # the card stays taken until sd-server lets go of the job
+    assert e.cancelled and not e.queue.turns
 
 
 async def test_idle_engine_does_not_fail_a_briefly_queued_job(monkeypatch):
@@ -75,3 +77,4 @@ async def test_stuck_engine_fails_queued_job(monkeypatch):
     e = _engine(monkeypatch, ["queued"] * 30, ahead_progresses=False)
     with pytest.raises(EngineError, match="no progress"):
         await e.generate({}, timeout=100)
+    await asyncio.gather(*e.queue._settling)

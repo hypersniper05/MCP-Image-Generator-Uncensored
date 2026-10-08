@@ -225,6 +225,13 @@ class TransparencyConfig(_Section):
     method: Literal["hybrid", "native", "matte"] = "hybrid"
     threads: int = Field(0, ge=0)  # CPU threads for the background-removal model (0 = the default)
     matte_model: Literal["birefnet-general-lite", "birefnet-general", "isnet-general-use"] = "birefnet-general-lite"
+    # Clean edges: estimate the true colour of soft edge pixels, so the old background (the model's fill colour, or
+    # the photo behind a cut-out) does not tint them.
+    decontaminate: bool = True
+    # What fully transparent pixels hold: "black" (smallest file, nothing of the source image left), "edge" (the
+    # nearest visible colour; better for game engines and mipmaps) or "keep" (leave them as they are, and pass the
+    # alpha of upscale/watermark inputs through unchanged: for textures that store data in the alpha channel).
+    hidden_pixels: Literal["black", "edge", "keep"] = "black"
 
 
 class PanoramaConfig(_Section):

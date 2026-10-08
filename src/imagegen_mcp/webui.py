@@ -49,10 +49,16 @@ async function recent(){try{const r=await fetch('api/images');const d=await r.js
  $('#recent').innerHTML=d.outputs_and_uploads.map(e=>{const pano=!!e.viewer_url||/panorama-/.test(e.file);
   const href=pano?'view/'+e.file:e.url;return `<a href="${href}" target="_blank" title="${e.file}"><img loading="lazy" src="outputs/${e.file}"><span>${e.file}</span></a>`}).join('')
   ||'<span class="muted">nothing yet</span>';}catch(e){}}
+// navigator.clipboard exists only on https and localhost pages; on a plain-http network address use execCommand
+async function copyText(t){if(navigator.clipboard&&window.isSecureContext){try{await navigator.clipboard.writeText(t);return true}catch(e){}}
+ const a=document.createElement('textarea');a.value=t;a.setAttribute('readonly','');a.style.cssText='position:fixed;top:-1000px;opacity:0';
+ document.body.appendChild(a);a.select();let ok=false;try{ok=document.execCommand('copy')}catch(e){}a.remove();return ok}
 function row(res,name){const d=document.createElement('div');d.className='row';
  d.innerHTML=res.error?`<div class="grow error">${name}: ${res.error}</div>`:
  `<img src="outputs/${res.file}"><div class="grow"><div>${name} &middot; ${res.width}x${res.height}</div><code>${res.file}</code></div><button>Copy</button>`;
- const b=d.querySelector('button');if(b)b.onclick=()=>{navigator.clipboard.writeText(res.file);b.textContent='Copied'};
+ const b=d.querySelector('button');if(b)b.onclick=async()=>{if(await copyText(res.file)){b.textContent='Copied';return}
+  const r=document.createRange();r.selectNodeContents(d.querySelector('code'));const sel=getSelection();sel.removeAllRanges();
+  sel.addRange(r);b.textContent=/Mac/.test(navigator.platform)?'Press ⌘C':'Press Ctrl+C'};
  $('#uploaded').prepend(d);}
 async function send(files){for(const f of files){try{const r=await fetch('upload?name='+encodeURIComponent(f.name),
  {method:'POST',headers:{'Content-Type':f.type||'application/octet-stream'},body:f});row(await r.json(),f.name);}

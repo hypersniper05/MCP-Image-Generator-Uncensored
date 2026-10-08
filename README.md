@@ -178,8 +178,11 @@ docker compose up -d --build
 
 </details>
 
-> The server has **no authentication** and listens on all network interfaces, so other computers on your
-> network can reach it at `http://<this-computer's-ip>:5005/mcp`. Only run it on a network you trust.
+> **Security note.** The server is open by design, so it is easy to connect to: it has **no login**, it
+> listens on all network interfaces, and it accepts requests from any web page. Anyone who can reach port 5005
+> can make images and see every image on the server, and so can a web page open in a browser on your network.
+> Run it on your own computer or a network you trust, use a VPN such as Tailscale for remote access, and never
+> forward the port to the internet.
 
 ## Connect an MCP client
 
@@ -344,6 +347,7 @@ model files are downloaded from their original sources and keep their own licens
 | [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) background removal, via [rembg](https://github.com/danielgatis/rembg) | Peng Zheng et al.; Daniel Gatis | MIT (the optional `isnet-general-use` model: Apache-2.0) |
 | [4xNomos2_otf_esrgan](https://huggingface.co/Phips/4xNomos2_otf_esrgan) upscaler ([models](https://github.com/Phhofm/models)) | Philip Hofmann | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
 | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (`RealESRGAN_x4plus`, optional upscaler) | Xintao Wang | BSD-3-Clause |
+| [PyMatting](https://github.com/pymatting/pymatting) foreground estimation (ported, for clean transparent edges) | Thomas Germer et al. | MIT |
 | [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) and ggml (the inference engine) | leejet and contributors | MIT |
 | [Pannellum](https://pannellum.org) (the 360 viewer) | Matthew Petroff | MIT |
 

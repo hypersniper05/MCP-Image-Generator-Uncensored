@@ -25,7 +25,8 @@ from .config import Config
 from .imaging import ImageInputError
 from .jobs import Job
 from .sdserver import EngineError
-from .service import REQUEST_BASE_URL, ImageService, OpResult, ServiceUnavailable, base_url_from_headers
+from .service import (REQUEST_BASE_URL, ImageService, OpResult, ServiceUnavailable, base_url_from_headers,
+                      servable)
 
 log = logging.getLogger("imagegen.server")
 
@@ -629,9 +630,11 @@ def create_server(service: ImageService) -> MCPServer:
 
     @mcp.tool(annotations=ToolAnnotations(title="List images", readOnlyHint=True, openWorldHint=False))
     async def list_images(
+        ctx: Context,
         limit: Annotated[int, Field(ge=1, le=200, description="Maximum number of entries in the combined results-and-uploads list (and in the inputs folder list).")] = 30,
     ) -> dict:
         """List recent generated and uploaded images (and files in the inputs folder) that can be used as inputs by their 'file' path or 'url'. Users upload images on this server's /upload page; uploads appear under uploads/. Results and uploads share one list of `limit` entries, newest first."""
+        _remember_base_url(ctx)
         return service.list_images(limit)
 
     @mcp.tool(annotations=ToolAnnotations(title="View image", readOnlyHint=True, openWorldHint=False))
@@ -668,7 +671,9 @@ def create_server(service: ImageService) -> MCPServer:
         outputs = Path(cfg.outputs_dir).resolve()
         if path.is_relative_to(outputs):
             rel = path.relative_to(outputs).as_posix()
-            info.update(file=rel, url=f"{service.base_url()}/outputs/{rel}")
+            info["file"] = rel
+            if _output_file(rel) is not None:  # only files the /outputs route serves get a link
+                info["url"] = f"{service.base_url()}/outputs/{rel}"
         text = f"{info['file']}: {width}x{height} {mime.split('/')[1].upper()}, {len(data)} bytes (original size)"
         if info.get("url"):
             text += f"\nLink: {info['url']}"
@@ -686,8 +691,15 @@ def create_server(service: ImageService) -> MCPServer:
     outputs_root = Path(cfg.outputs_dir).resolve()
 
     def _output_file(rel: str) -> Path | None:
-        p = (outputs_root / rel).resolve()
-        return p if outputs_root in p.parents and p.is_file() else None
+        """An image under outputs/. Hidden files (e.g. .previews.json) and other file types are never served."""
+        if not servable(rel):
+            return None
+        try:
+            p = (outputs_root / rel).resolve()
+            ok = outputs_root in p.parents and servable(p.relative_to(outputs_root).as_posix()) and p.is_file()
+        except (OSError, ValueError, RuntimeError):  # NUL byte, name too long, symlink loop: not served
+            return None
+        return p if ok else None
 
     @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
     async def health(request: Request) -> Response:

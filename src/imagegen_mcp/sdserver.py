@@ -25,6 +25,7 @@ import httpx
 
 from .config import Config
 from .devices import DevicePlan
+from .jobs import note_turn
 
 log = logging.getLogger("imagegen.sdserver")
 
@@ -88,6 +89,7 @@ class GpuQueue:
         loop = asyncio.get_running_loop()
         t = Turn(kind, estimate, loop.create_future())
         self.turns.append(t)
+        note_turn(t, self)  # the job running this call can now report its place in line
         if self.turns[0] is t:
             t.ready.set_result(None)
         try:

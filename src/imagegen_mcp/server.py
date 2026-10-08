@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Annotated, Literal
 
+from mcp.server.apps import Apps
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, ImageContent, TextContent, ToolAnnotations
@@ -20,7 +23,7 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from . import __version__, imaging, panorama, webui
+from . import __version__, imaging, panorama, viewer, webui
 from .config import Config
 from .imaging import ImageInputError
 from .jobs import Job
@@ -45,8 +48,9 @@ __WATERMARK_LINE____UPSCALE_LINE__- view_image: look at an image stored on this 
 Input images can be data URLs, base64, http(s) URLs, or this server's images: pass the full link, or the file
 path exactly as a result or list_images gave it, including its date folder (e.g. "2026-09-23/image-021530-ab12cd34.png").
 Users can upload their own images on the server's web page (/upload); list_images shows what is available.
-__TIMING__ If a call returns a "Still working" message with a job_id instead of an image, the job is still
-running: call get_job with that job_id to wait for the result.
+__TIMING__ If a call returns "Not finished yet" with a job_id, the job keeps running on the server: call
+get_job with that job_id to get the image. Never call the same tool again for that request (it would render the
+image twice). If a call was cut off before you saw a job_id, call get_job without a job_id to find the job.
 
 Quality guide:
 - Prompts: detailed and explicit beats short keyword lists. Describe the subject, setting, composition,
@@ -67,7 +71,8 @@ UPSCALE_DESCRIPTION = (
     "print or a wallpaper. The result is at most 8192 px per side: larger inputs are reduced first. Transparency is "
     "kept. A 360 panorama (for example from generate_panorama) stays a 360 panorama: the wrap-around edges stay "
     "seamless, the result keeps the Photo Sphere metadata and comes with a 360 viewer link. It takes seconds to "
-    "about a minute, and longer for very large images. If a call returns a job_id, call get_job with it.")
+    "about a minute, and longer for very large images. If a call returns a job_id, call get_job with it instead of "
+    "calling upscale_image again.")
 
 AspectRatio = Literal["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9", "9:21", "2:1", "1:2", "5:4", "4:5"]
 SizeTier = Literal["small", "medium", "large", "xl"]
@@ -80,12 +85,6 @@ Size = Annotated[Literal["small", "medium", "large", "xl"] | None, Field(descrip
     "Resolution tier, i.e. the pixel count (aspect_ratio sets the shape): small ~0.26 MP, medium ~1 MP, large "
     "~2 MP, xl ~4 MP = native 2K, the sharpest. The tool description says which to use; sizes above the "
     "server's limit are scaled down."))]
-WaitSeconds = Annotated[int | None, Field(ge=0, le=3600, description=(
-    "Seconds to wait for the image before returning a job_id to poll with get_job. Leave unset for the "
-    "server's default (usually 50)."))]
-JobWait = Annotated[int | None, Field(ge=0, le=3600, description=(
-    "Seconds to wait for the job to finish before returning its progress again. Leave unset for the server's "
-    "default (usually 50)."))]
 Guidance = Annotated[float | None, Field(ge=0, le=20, description=(
     "Guidance scale. Leave unset unless the user asks; the tool description gives this server's default. 3-5 "
     "gives cleaner, more coherent images that follow the prompt closely and uses the negative prompt; 1 is about "
@@ -112,8 +111,8 @@ EditWidth = Annotated[int | None, Field(ge=256, le=4096, description=(
 EditHeight = Annotated[int | None, Field(ge=256, le=4096, description=(
     "Output height in pixels, rounded to a multiple of 32. With only height, the width follows aspect_ratio or "
     "the shape of <image1>. Overrides size. Leave unset to keep the shape of <image1>."))]
-JOB_LINE = ('If the call returns a "Still working" message with a job_id instead of an image, call get_job with '
-            "that job_id until the image is ready.")
+JOB_LINE = ('If the call returns "Not finished yet" with a job_id, the job keeps running on the server: call get_job '
+            "with that job_id. Never call this tool again for the same request: that renders it twice.")
 
 
 def _guide(cfg: Config) -> dict[str, str]:
@@ -293,8 +292,12 @@ Panoramas take a minute or more. {JOB_LINE}"""
 
 # Optional request headers (e.g. injected by an MCP bridge) that adapt results to a client.
 INLINE_HEADER = "x-imagegen-inline"  # "data-uri-text": images as data-URI text lines (llama.cpp server-side MCP)
-MAX_WAIT_HEADER = "x-imagegen-max-wait"  # upper bound for wait_seconds, in seconds
+MAX_WAIT_HEADER = "x-imagegen-max-wait"  # how long a call waits before returning a job_id (also ?max_wait=N)
+MAX_WAIT_LIMIT = 280  # seconds; longer waits run into common client limits (300 s) with little gain
 INLINE_MAX_HEADER = "x-inline-max-bytes"  # raise the inline image budget for clients without message limits
+VIEWER_PREVIEW_BYTES = 100_000  # in-chat viewer images: hosts may drop tool results over ~150,000 characters
+# Image tools declare the in-chat viewer; hosts without MCP Apps ignore it. "ui/resourceUri" is the older flat key.
+UI_META = {"ui": {"resourceUri": viewer.URI}, "ui/resourceUri": viewer.URI}
 
 
 def _header(ctx, name: str) -> str:
@@ -314,11 +317,99 @@ def _clip(msg: str, limit: int = 600) -> str:
     return msg if len(msg) <= limit else msg[:limit] + f"...({len(msg)} chars)"
 
 
+def _uint(value: str) -> int | None:
+    """A plain non-negative ASCII integer, or None (junk values such as '²' are ignored)."""
+    return int(value) if value.isascii() and value.isdigit() and len(value) < 10 else None
+
+
+def _label(args: dict) -> str:
+    """A short description of a request for job listings: the start of the prompt, or the input image's name (never
+    inline image data)."""
+    p = args.get("prompt")
+    if isinstance(p, str) and p.strip():
+        p = " ".join(p.split())
+        return p[:80] + ("..." if len(p) > 80 else "")
+    src = args.get("image") or (args.get("images") or [None])[0]
+    if isinstance(src, str) and not src.startswith("data:") and len(src) < 300:
+        return "image " + src.rstrip("/").rsplit("/", 1)[-1][:60]
+    return "an uploaded image" if src else ""
+
+
+def _query(ctx, name: str) -> str:
+    try:
+        return (ctx.request_context.request.query_params.get(name) or "").strip()
+    except Exception:  # noqa: BLE001 - no HTTP request (stdio, in-process tests)
+        return ""
+
+
+def fingerprint(kind: str, args: dict) -> str:
+    """A stable key for "the same request": the tool and its arguments, with long values (inline image data)
+    replaced by their hash."""
+    def norm(v):
+        if isinstance(v, str) and len(v) > 256:
+            return "sha256:" + hashlib.sha256(v.encode("utf-8", "replace")).hexdigest()
+        if isinstance(v, (list, tuple)):
+            return [norm(x) for x in v]
+        return v
+    body = json.dumps({"kind": kind, **{k: norm(v) for k, v in sorted(args.items())}}, sort_keys=True, default=str)
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _about(seconds: float) -> str:
+    if seconds < 90:
+        return f"about {max(10, int(round(seconds / 10)) * 10)} s"
+    return f"about {int(round(seconds / 60))} min"
+
+
+def _ordinal(n: int) -> str:
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
 def create_server(service: ImageService) -> MCPServer:
     cfg: Config = service.cfg
     guide = _guide(cfg)
+
+    # ------------------------------------------------------------------ in-chat viewer (MCP Apps)
+    apps = Apps()
+    apps.add_html_resource(viewer.URI, viewer.HTML, name="Image viewer",
+                           description="Shows an image job's progress and the finished image in the chat.",
+                           prefers_border=False)
+
+    @apps.tool(resource_uri=viewer.URI, visibility=["app"], name="job_status", title="Job status (image viewer)",
+               description="Used only by the in-chat image viewer. To get an image, call get_job instead.",
+               annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+    async def job_status(job_id: Annotated[str, Field(description="The job_id.")]) -> CallToolResult:
+        job = service.jobs.get(job_id)
+        nxt = json.dumps({"job_id": job_id.strip()})
+        if job is None:  # e.g. a reopened conversation after a restart or 24 h: not an error for the viewer
+            return CallToolResult(content=[TextContent(type="text", text=(
+                "This job is no longer on the server (results are kept for 24 hours). The image links in the chat "
+                "still work, and list_images shows the saved images."))],
+                structured_content={"job_id": job_id, "status": "expired"})
+        st = job.summary()
+        if job.status == "running":
+            return CallToolResult(content=[TextContent(type="text", text=(
+                f"Status: {_status_line(job)}. Not finished yet. To get the image, call get_job with {nxt} (it waits "
+                "for the job). Do NOT re-render the image again."))], structured_content=st)
+        if job.status != "completed":
+            return _error(job.error or f"job {job.status}")
+        # Small previews only (the viewer shows them inline; the links have the full files), built off the event loop
+        # once per job. Not marked delivered: the model may still fetch the result with get_job.
+        if job.viewer_previews is None:
+            job.viewer_previews = await asyncio.to_thread(
+                lambda: [_fit(s, VIEWER_PREVIEW_BYTES, chat_safe=False) for s in job.result.images])
+        blocks, images, lines = [], [], []
+        for s, (data, mime) in zip(job.result.images, job.viewer_previews):
+            blocks.append(ImageContent(type="image", data=base64.b64encode(data).decode(), mimeType=mime))
+            images.append({"url": s.url, "file": s.filename, "width": s.width, "height": s.height,
+                           "viewer_url": s.view_url})
+            lines.append(f"Image ready: {s.url} (file for edit_image and other tools: {s.filename})")
+        lines.append(f"The inline image is a small preview; get_job with {nxt} returns the full result.")
+        return CallToolResult(content=[*blocks, TextContent(type="text", text="\n".join(lines))],
+                              structured_content={**st, "images": images, "delivered": job.delivered})
+
     mcp = MCPServer(name="imagegen-mcp", title="Image Gen MCP", version=__version__,
-                    instructions=guide["instructions"], log_level=cfg.server.log_level)
+                    instructions=guide["instructions"], log_level=cfg.server.log_level, extensions=[apps])
 
     # ------------------------------------------------------------------ results
     def _fit(s, budget: int, chat_safe: bool) -> tuple[bytes, str]:
@@ -326,10 +417,11 @@ def create_server(service: ImageService) -> MCPServer:
         side = cfg.outputs.preview_max_side
         make = imaging.chat_preview if chat_safe else (
             lambda im, sd: imaging.preview(im, sd, keep_alpha=im.mode == "RGBA"))
-        data, mime = make(s.image, side)
+        img = s.image  # decoded once: SavedImage.image may read the file from disk on every access
+        data, mime = make(img, side)
         while len(data) > budget and side > 256:
             side = int(side * 0.75)
-            data, mime = make(s.image, side)
+            data, mime = make(img, side)
         return data, mime
 
     def _result(op: OpResult, *, data_uri_text: bool = False, inline_max: int | None = None) -> CallToolResult:
@@ -427,29 +519,92 @@ def create_server(service: ImageService) -> MCPServer:
                 pass
         return cb
 
-    def _pending(job: Job) -> CallToolResult:
-        st = job.summary()
-        text = (f"Still working: job {job.id} is at {st['progress_percent']}% ({job.message}). It keeps running in "
-                f"the background. Call the get_job tool of this image server (some clients list it with a prefix, "
-                f'e.g. imagegen_get_job) with job_id="{job.id}" to wait for and fetch the image.')
-        return CallToolResult(content=[TextContent(type="text", text=text)], structured_content=st)
+    def _budget(ctx: Context | None) -> tuple[int, str]:
+        """How long a call waits before it returns a job_id: chosen by the server (generation.wait_seconds), or by
+        the user for their client with ?max_wait=N on the endpoint URL or the X-Imagegen-Max-Wait header. The model
+        does not choose it: it cannot know the client's time limit."""
+        wait, source = cfg.generation.wait_seconds, "default"
+        for value, src in ((_query(ctx, "max_wait"), "url"), (_header(ctx, MAX_WAIT_HEADER), "header")):
+            n = _uint(value)
+            if n is not None:
+                wait, source = n, src
+        return max(0, min(wait, MAX_WAIT_LIMIT)), source
 
-    async def _collect(job: Job, ctx: Context | None, wait_seconds: int | None) -> CallToolResult:
-        wait = cfg.generation.wait_seconds if wait_seconds is None else wait_seconds
-        cap = _header(ctx, MAX_WAIT_HEADER)
-        if cap.isdigit():  # the client knows its own request deadline (e.g. llama.cpp timeout_ms)
-            wait = min(wait, int(cap))
-        done = await service.jobs.wait(job, wait, _progress(ctx) if ctx is not None else None)
-        if not done:
-            return _pending(job)
+    def _status_line(job: Job) -> str:
+        place, eta = job.place()
+        if job.status != "running":
+            return job.status
+        if place:
+            text = f"{_ordinal(place)} in line"
+        elif job.progress > 0:
+            text = f"working, {round(job.progress * 100)}% done"
+        else:
+            text = "starting"
+        if eta is not None:
+            text += f", {_about(eta)} left" if eta > 5 else ", should finish soon"
+        return text
+
+    def _pending(jobs: list[Job], budget: int, reused: bool = False) -> CallToolResult:
+        """The reply while jobs are still running: a normal result (not an error) that tells the model exactly what
+        to do next, in the text and in the structured content (some clients show the model only one of them)."""
+        n = max(j.polls for j in jobs) + 1
+        for j in jobs:
+            j.announced = True  # the client has the id now: an identical call later is a new request
+        if len(jobs) == 1:
+            job = jobs[0]
+            args: dict = {"job_id": job.id, "poll": n}
+            if reused:
+                ago = _about(time.time() - job.created).replace("about ", "")
+                first = (f"This exact request is already running as job {job.id} (started {ago} ago), so no second "
+                         "render was started.")
+            else:
+                first = "Not finished yet. This is normal: nothing failed and the job keeps running on the server."
+            status = f"Status: {_status_line(job)}."
+        else:
+            args = {"job_ids": [j.id for j in jobs], "poll": n}
+            first = "Not finished yet. This is normal: nothing failed and the jobs keep running on the server."
+            status = "Status: " + "; ".join(f"{j.id} {_status_line(j)}" for j in jobs) + "."
+        call = json.dumps(args)
+        lines = [first,
+                 f"NEXT STEP: call get_job with {call}. It waits up to {budget} s and returns the image as soon as it "
+                 "is ready.",
+                 "Do NOT re-render the image again.",
+                 status]
+        summaries = [j.summary() for j in jobs]
+        structured: dict = {"status": "running", "reused": reused, "wait_budget_seconds": budget,
+                            "next_step": f"Call get_job with {call}. Do NOT re-render the image again.",
+                            "next": {"tool": "get_job", "arguments": args}}
+        if len(jobs) == 1:
+            st = summaries[0]
+            structured.update(job_id=st["job_id"], kind=st["kind"], progress_percent=st["progress_percent"],
+                              queue_position=st["queue_position"], eta_seconds=st["eta_seconds"],
+                              elapsed_seconds=st["elapsed_s"], message=st["message"])
+        else:
+            structured["jobs"] = summaries
+        return CallToolResult(content=[TextContent(type="text", text="\n".join(lines))], structured_content=structured)
+
+    def _finished(job: Job, ctx: Context | None, share: float = 1.0) -> CallToolResult:
+        """The finished job's reply. share: this job's part of the inline image budget when one reply carries several
+        jobs (all images of one reply together stay under the client's message limit)."""
+        job.announced = True
         if job.status == "completed":
-            inline_max = _header(ctx, INLINE_MAX_HEADER)
+            cap = _uint(_header(ctx, INLINE_MAX_HEADER))
+            total = max(10_000, min(cap, 64 * 1024 * 1024)) if cap is not None else cfg.outputs.inline_max_bytes
             r = _result(job.result, data_uri_text=_header(ctx, INLINE_HEADER).lower() == "data-uri-text",
-                        inline_max=max(10_000, min(int(inline_max), 64 * 1024 * 1024)) if inline_max.isdigit()
-                        else None)
+                        inline_max=max(1, int(total * share)))
             r.structured_content["job_id"] = job.id
+            r.structured_content["status"] = "completed"
+            job.delivered = True
             return r
-        return _error(job.error or f"job {job.status}")
+        if job.status == "failed":
+            return _error(f"{job.error or 'the job failed'}\nDo not retry automatically: tell the user what happened "
+                          "and ask before trying again.")
+        return _error(f"job {job.id} was {job.status}")
+
+    async def _collect(job: Job, ctx: Context | None, reused: bool = False) -> CallToolResult:
+        budget, _ = _budget(ctx)
+        done = await service.jobs.wait(job, budget, _progress(ctx) if ctx is not None else None)
+        return _finished(job, ctx) if done else _pending([job], budget, reused)
 
     def _client(ctx: Context | None) -> str:
         """Who sent the request, for the job log: address (and forwarded-for) plus User-Agent."""
@@ -462,18 +617,39 @@ def create_server(service: ImageService) -> MCPServer:
         fwd, ua = _header(ctx, "x-forwarded-for"), _header(ctx, "user-agent")
         return f"{addr}{f' (forwarded for {fwd})' if fwd else ''} ua={ua[:80]!r}"
 
-    def _submit(kind: str, factory, ctx: Context | None, detail: str = "") -> Job:
-        job = service.jobs.submit(kind, factory)
-        log.info("job %s %s%s from %s", job.id, kind, f" [{detail}]" if detail else "", _client(ctx))
-        return job
+    def _caller(ctx: Context | None) -> str:
+        """Who is asking, so a retry matches its own job and not another client's: the first forwarded-for address
+        (or the peer address) and the User-Agent."""
+        addr = _header(ctx, "x-forwarded-for").split(",")[0].strip()
+        if not addr:
+            try:
+                req = ctx.request_context.request
+                addr = req.client.host if req is not None and req.client else ""
+            except Exception:  # noqa: BLE001 - no HTTP request (stdio, in-process tests)
+                addr = ""
+        return f"{addr}|{_header(ctx, 'user-agent')}"
 
-    async def _start(kind: str, factory, ctx: Context, wait_seconds: int | None, detail: str = "") -> CallToolResult:
-        try:
-            service.require_ready()
-        except ServiceUnavailable as exc:
-            return _error(str(exc))
+    async def _start(kind: str, factory, ctx: Context, args: dict, detail: str = "",
+                     require_engine: bool = True) -> CallToolResult:
+        """Start a job, or attach to the identical request that is already running (a retry after the client gave
+        up), then wait for it up to the server's wait budget."""
+        if require_engine:
+            try:
+                service.require_ready()
+            except ServiceUnavailable as exc:
+                return _error(str(exc))
         _remember_base_url(ctx)
-        return await _collect(_submit(kind, factory, ctx, detail), ctx, wait_seconds)
+        budget, source = _budget(ctx)
+        key = fingerprint(kind, {**args, "_caller": _caller(ctx)})
+        job = service.jobs.find_reusable(key)
+        if job is not None:
+            log.info("job %s %s: identical request attached to the running job (wait %ss from %s) from %s",
+                     job.id, kind, budget, source, _client(ctx))
+            return await _collect(job, ctx, reused=True)
+        job = service.jobs.submit(kind, factory, key=key, label=_label(args))
+        log.info("job %s %s%s wait=%ss(%s) from %s", job.id, kind, f" [{detail}]" if detail else "", budget, source,
+                 _client(ctx))
+        return await _collect(job, ctx)
 
     def _remember_base_url(ctx: Context | None) -> None:
         try:
@@ -483,7 +659,7 @@ def create_server(service: ImageService) -> MCPServer:
 
     # ------------------------------------------------------------------ tools
     @mcp.tool(description=guide["generate"],
-              annotations=ToolAnnotations(title="Generate image", readOnlyHint=False, destructiveHint=False,
+              meta=UI_META, annotations=ToolAnnotations(title="Generate image", readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=False, openWorldHint=False))
     async def generate_image(
         prompt: Annotated[str, Field(description="Detailed description of the image: subject, setting, composition, lighting, colors, and medium or camera; text to render in double quotes. No resolutions or '4K' words.")],
@@ -499,16 +675,15 @@ def create_server(service: ImageService) -> MCPServer:
         cfg_scale: Guidance = None,
         seed: Seed = None,
         output_format: Annotated[Fmt | None, Field(description="File format of the saved image (png default).")] = None,
-        wait_seconds: WaitSeconds = None,
     ) -> CallToolResult:
-        return await _start("generate", lambda progress: service.generate(
-            prompt=prompt, negative_prompt=negative_prompt, width=width, height=height, aspect_ratio=aspect_ratio,
-            size=size, transparent=transparent, steps=steps, cfg_scale=cfg_scale, seed=seed,
-            output_format=output_format, tileable=tileable, progress=progress), ctx, wait_seconds,
+        args = dict(prompt=prompt, negative_prompt=negative_prompt, width=width, height=height,
+                    aspect_ratio=aspect_ratio, size=size, transparent=transparent, steps=steps, cfg_scale=cfg_scale,
+                    seed=seed, output_format=output_format, tileable=tileable)
+        return await _start("generate", lambda progress: service.generate(**args, progress=progress), ctx, args,
             f"size={size} {width}x{height} ar={aspect_ratio} steps={steps} transparent={transparent} tileable={tileable}")
 
     @mcp.tool(description=guide["edit"],
-              annotations=ToolAnnotations(title="Edit or combine images", readOnlyHint=False, destructiveHint=False,
+              meta=UI_META, annotations=ToolAnnotations(title="Edit or combine images", readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=False, openWorldHint=True))
     async def edit_image(
         prompt: Annotated[str, Field(description="The edit instruction: start with the operation, then 'keep everything else unchanged'. Refer to inputs as <image1>, <image2>, ... e.g. 'Put the cat from <image2> on the sofa in <image1>, keep everything else unchanged', 'Remove the people in the background', 'Change the style to a watercolor painting'.")],
@@ -526,17 +701,16 @@ def create_server(service: ImageService) -> MCPServer:
         seed: EditSeed = None,
         output_format: Annotated[Fmt | None, Field(description="File format of the saved image (png default).")] = None,
         tileable: Annotated[bool | None, Field(description="Leave unset: when the first image is a seamless tile made by this server (generate_image tileable=true, or an earlier tileable edit or upscale), the edit keeps it seamless and at the same size, e.g. for height, normal or roughness maps of a texture. true: treat the first image as a seamless tile (e.g. a texture from elsewhere). false: a normal edit.")] = None,
-        wait_seconds: WaitSeconds = None,
     ) -> CallToolResult:
-        return await _start("edit", lambda progress: service.edit(
-            prompt=prompt, images=images, mask=mask, negative_prompt=negative_prompt, width=width, height=height,
-            aspect_ratio=aspect_ratio, size=size, transparent=transparent, steps=steps, cfg_scale=cfg_scale,
-            seed=seed, output_format=output_format, tileable=tileable, progress=progress), ctx, wait_seconds,
+        args = dict(prompt=prompt, images=images, mask=mask, negative_prompt=negative_prompt, width=width,
+                    height=height, aspect_ratio=aspect_ratio, size=size, transparent=transparent, steps=steps,
+                    cfg_scale=cfg_scale, seed=seed, output_format=output_format, tileable=tileable)
+        return await _start("edit", lambda progress: service.edit(**args, progress=progress), ctx, args,
             f"{len(images)} image(s) mask={mask is not None} size={size} {width}x{height} ar={aspect_ratio} steps={steps}"
             + (f" tileable={tileable}" if tileable is not None else ""))
 
     @mcp.tool(description=guide["panorama"],
-              annotations=ToolAnnotations(title="Generate 360 panorama", readOnlyHint=False, destructiveHint=False,
+              meta=UI_META, annotations=ToolAnnotations(title="Generate 360 panorama", readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=False, openWorldHint=True))
     async def generate_panorama(
         prompt: Annotated[str, Field(description="The scene only, in every direction: the ground, the horizon, the sky or ceiling, and what is in front, to the left and right, and behind the viewer, e.g. 'a misty pine forest at sunrise, a wooden cabin with smoke from the chimney in front, a lake behind, mossy ground'. Do not write '360', 'panorama' or 'equirectangular'; the server adds that.")],
@@ -549,47 +723,44 @@ def create_server(service: ImageService) -> MCPServer:
         cfg_scale: Guidance = None,
         seed: Seed = None,
         output_format: Annotated[Fmt | None, Field(description="jpeg (default, best viewer support), png or webp.")] = None,
-        wait_seconds: WaitSeconds = None,
     ) -> CallToolResult:
-        return await _start("panorama", lambda progress: service.panorama(
-            prompt=prompt, image=image, negative_prompt=negative_prompt, width=width, steps=steps,
-            cfg_scale=cfg_scale, seed=seed, seam_fix=seam_fix, output_format=output_format, progress=progress),
-            ctx, wait_seconds, f"width={width} from_image={image is not None} seam_fix={seam_fix} steps={steps}")
+        args = dict(prompt=prompt, image=image, negative_prompt=negative_prompt, width=width, steps=steps,
+                    cfg_scale=cfg_scale, seed=seed, seam_fix=seam_fix, output_format=output_format)
+        return await _start("panorama", lambda progress: service.panorama(**args, progress=progress), ctx, args,
+            f"width={width} from_image={image is not None} seam_fix={seam_fix} steps={steps}")
 
-    @mcp.tool(annotations=ToolAnnotations(title="Remove background", readOnlyHint=False, destructiveHint=False,
+    @mcp.tool(meta=UI_META, annotations=ToolAnnotations(title="Remove background", readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=True, openWorldHint=True))
     async def remove_background(
         image: Annotated[str, Field(description="Image to cut out: data URL, base64, http(s) URL, or this server's link or file path exactly as given (with the date folder).")],
         ctx: Context,
         output_format: Annotated[Literal["png", "webp"], Field(description="png (default) or webp; both keep the alpha channel.")] = "png",
-        wait_seconds: WaitSeconds = None,
     ) -> CallToolResult:
         """Remove the background of an image and return the subject with a transparent background (PNG by default)."""
         if service.matter is None:
             return _error("background removal is not available yet (models are still loading) or it is disabled "
                           "(transparency.method is 'native')")
-        _remember_base_url(ctx)
-        job = _submit("remove_background", lambda progress: service.remove_background(
-            image=image, output_format=output_format, progress=progress), ctx)
-        return await _collect(job, ctx, wait_seconds)
+        args = dict(image=image, output_format=output_format)
+        return await _start("remove_background", lambda progress: service.remove_background(**args, progress=progress),
+                            ctx, args, require_engine=False)
 
     if cfg.watermark.enabled:
         @mcp.tool(description=guide["watermark"],
-                  annotations=ToolAnnotations(title="Remove watermarks", readOnlyHint=False, destructiveHint=False,
+                  meta=UI_META, annotations=ToolAnnotations(title="Remove watermarks", readOnlyHint=False, destructiveHint=False,
                                               idempotentHint=False, openWorldHint=True))
         async def remove_watermark(
             image: Annotated[str, Field(description="Image to clean: data URL, base64, http(s) URL, or this server's link or file path exactly as given (with the date folder).")],
             ctx: Context,
             seed: EditSeed = None,
             output_format: Annotated[Fmt | None, Field(description="File format of the saved image (png default).")] = None,
-            wait_seconds: WaitSeconds = None,
         ) -> CallToolResult:
-            return await _start("remove_watermark", lambda progress: service.remove_watermark(
-                image=image, seed=seed, output_format=output_format, progress=progress), ctx, wait_seconds)
+            args = dict(image=image, seed=seed, output_format=output_format)
+            return await _start("remove_watermark", lambda progress: service.remove_watermark(**args, progress=progress),
+                                ctx, args)
 
     if cfg.upscale.enabled:
         @mcp.tool(description=UPSCALE_DESCRIPTION,
-                  annotations=ToolAnnotations(title="Upscale image", readOnlyHint=False, destructiveHint=False,
+                  meta=UI_META, annotations=ToolAnnotations(title="Upscale image", readOnlyHint=False, destructiveHint=False,
                                               idempotentHint=True, openWorldHint=True))
         async def upscale_image(
             image: Annotated[str, Field(description="Image to enlarge: data URL, base64, http(s) URL, or this server's link or file path exactly as given (with the date folder).")],
@@ -598,25 +769,77 @@ def create_server(service: ImageService) -> MCPServer:
             output_format: Annotated[Fmt | None, Field(description="File format of the saved image (png default, jpeg for 360 panoramas; jpeg is much smaller for very large results).")] = None,
             panorama: Annotated[bool | None, Field(description="Leave unset: images tagged as 360 panoramas (Photo Sphere metadata, as generate_panorama makes them) are detected. true: treat a 2:1 image without that tag as a 360 panorama. false: plain upscale.")] = None,
             tileable: Annotated[bool | None, Field(description="Leave unset: seamless tiles made by this server are detected and stay seamless (both directions wrap). true: treat the image as a seamless tile (e.g. a texture from elsewhere). false: plain upscale.")] = None,
-            wait_seconds: WaitSeconds = None,
         ) -> CallToolResult:
-            return await _start("upscale", lambda progress: service.upscale(
-                image=image, scale=scale, output_format=output_format, as_panorama=panorama, as_tileable=tileable,
-                progress=progress), ctx, wait_seconds, f"scale={scale}"
+            args = dict(image=image, scale=scale, output_format=output_format, as_panorama=panorama,
+                        as_tileable=tileable)
+            return await _start("upscale", lambda progress: service.upscale(**args, progress=progress), ctx, args,
+                f"scale={scale}"
                 + (f" panorama={panorama}" if panorama is not None else "")
                 + (f" tileable={tileable}" if tileable is not None else ""))
 
     @mcp.tool(annotations=ToolAnnotations(title="Get job result", readOnlyHint=True, openWorldHint=False))
     async def get_job(
-        job_id: Annotated[str, Field(description="The job_id returned by a tool call that did not finish in time.")],
         ctx: Context,
-        wait_seconds: JobWait = None,
+        job_id: Annotated[str | None, Field(description="The job_id from a reply that said 'Not finished yet'. Leave out job_id and job_ids to list the jobs of the last 30 minutes (e.g. when a call was cut off before you saw its job_id).")] = None,
+        job_ids: Annotated[list[str] | None, Field(max_length=20, description="Several job_ids at once: returns every finished image and the status of the others.")] = None,
+        poll: Annotated[int | None, Field(description="Optional counter: pass the value from the last reply's next step. The server ignores it.")] = None,
     ) -> CallToolResult:
-        """Wait for a running job and return its image(s), or its progress if it is still running."""
-        job = service.jobs.get(job_id)
-        if job is None:
-            return _error(f"unknown job_id {job_id!r} (finished jobs are kept for 24 hours)")
-        return await _collect(job, ctx, wait_seconds)
+        """Get the image(s) of a job that was not finished when its tool call returned. Waits a short time and returns
+        as soon as the job is done; if it is still running, the reply gives its status and the next call to make.
+        Results are kept for 24 hours. Calling this never starts a new render."""
+        ids = list(dict.fromkeys(i.strip() for i in [*([job_id] if job_id else []), *(job_ids or [])] if i.strip()))
+        if not ids:
+            recent = service.jobs.recent()
+            lines = [f"{j.id}: {j.kind}" + (f' "{j.label}"' if j.label else "")
+                     + f", {_status_line(j) if j.status == 'running' else j.status}"
+                     + (", already delivered" if j.delivered else "")
+                     + f", started {_about(time.time() - j.created).replace('about ', '')} ago" for j in recent]
+            text = ("Jobs of the last 30 minutes (newest first). Call get_job with a job_id to get its image:\n"
+                    + "\n".join(lines)) if lines else "No jobs in the last 30 minutes."
+            return CallToolResult(content=[TextContent(type="text", text=text)],
+                                  structured_content={"jobs": [j.summary() for j in recent]})
+        jobs = [service.jobs.get(i) for i in ids]
+        missing = [i for i, j in zip(ids, jobs) if j is None]
+        jobs = [j for j in jobs if j is not None]
+        if not jobs:
+            recent = ", ".join(j.id for j in service.jobs.recent()[:10]) or "none"
+            return _error(f"unknown job_id {', '.join(map(repr, missing))} (finished jobs are kept for 24 hours). "
+                          f"Recent jobs: {recent}. Call get_job without a job_id to list them.")
+        for j in jobs:
+            j.polls += 1
+        if len(jobs) == 1 and not missing:
+            return await _collect(jobs[0], ctx)
+        budget, _ = _budget(ctx)
+        open_jobs = [j for j in jobs if not j.done.is_set()]
+        if open_jobs and len(open_jobs) == len(jobs):  # nothing finished yet: wait for the first one
+            waiters = [asyncio.ensure_future(j.done.wait()) for j in open_jobs]
+            try:
+                await asyncio.wait(waiters, timeout=budget, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for w in waiters:
+                    w.cancel()
+        done = [j for j in jobs if j.done.is_set()]
+        still = [j for j in jobs if not j.done.is_set()]
+        content, entries = [], []
+        n_img = sum(len(j.result.images) for j in done if j.status == "completed") or 1
+        for j in done:
+            r = _finished(j, ctx, share=len(j.result.images) / n_img if j.status == "completed" else 1.0)
+            content += [TextContent(type="text", text=f"Job {j.id}:")] + list(r.content)
+            entry = {"job_id": j.id, "status": j.status}
+            if j.status == "completed":
+                entry.update(images=r.structured_content["images"], info=r.structured_content["info"])
+            else:
+                entry["error"] = j.error
+            entries.append(entry)
+        structured: dict = {"jobs": entries + [j.summary() for j in still]}
+        if missing:
+            content.append(TextContent(type="text", text=f"Unknown job_id(s): {', '.join(missing)}."))
+            structured["unknown"] = missing
+        if still:
+            p = _pending(still, budget)
+            content += list(p.content)
+            structured.update(next=p.structured_content["next"], next_step=p.structured_content["next_step"])
+        return CallToolResult(content=content, structured_content=structured)
 
     @mcp.tool(annotations=ToolAnnotations(title="Cancel job", readOnlyHint=False, destructiveHint=True,
                                           idempotentHint=True, openWorldHint=False))

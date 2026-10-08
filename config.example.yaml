@@ -109,9 +109,10 @@ generation:
   timeout_seconds: 1800    # stop a generation that runs longer than this (time spent waiting in the queue
   cpu_timeout_seconds: 7200 # does not count)
   warmup: true             # run a tiny generation at start so the first request is fast
-  wait_seconds: 50         # how long a tool call waits for its image. Longer jobs return a job_id and
-                           # keep running; clients fetch the result with the get_job tool. Keep this under
-                           # your MCP client's request timeout (many clients stop at 60 s).
+  wait_seconds: 25         # how long a tool call (and each get_job) waits for its image. Longer jobs return
+                           # a job_id and keep running; clients fetch the result with get_job. Keep this under
+                           # your MCP clients' tool-call time limit (the strictest common one is 30 s). A user can
+                           # change it per client with ?max_wait=N on the endpoint URL (at most 280).
   idle_unload_seconds: 0   # 0 = keep the model loaded. >0: free the GPU memory after this many idle seconds;
                            # the next request loads it again (about a minute).
 

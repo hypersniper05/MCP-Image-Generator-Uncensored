@@ -33,95 +33,64 @@ from .service import (REQUEST_BASE_URL, ImageService, OpResult, ServiceUnavailab
 
 log = logging.getLogger("imagegen.server")
 
-# Usage guidance the model sees. The descriptions are filled in with this server's configured defaults
-# (see _guide), so they stay true when config.yaml changes. Sources: the official Qwen-Image-2.1 settings,
-# community testing, and A/B runs of this server (see the README). Parameter descriptions carry no numbers
-# that depend on the config; they point at the tool description instead.
-INSTRUCTIONS = """\
-Image generation and editing with Qwen-Image-2.1 (local, GGUF).
-- generate_image: text-to-image in any size or aspect ratio; transparent=true gives a PNG with an alpha channel.
-- edit_image: edit or combine 1-10 input images (refer to them as <image1>, <image2>, ... in the prompt).
-  Use it to add, remove, replace or restyle elements or text, or to merge elements from several images.
-- generate_panorama: 360-degree equirectangular (2:1) panoramas with Photo Sphere metadata and a viewer link.
-- remove_background: cut out the subject of an image into a transparent PNG.
-__WATERMARK_LINE____UPSCALE_LINE__- view_image: look at an image stored on this server (a result or upload) at its original size.
-Input images can be data URLs, base64, http(s) URLs, or this server's images: pass the full link, or the file
-path exactly as a result or list_images gave it, including its date folder (e.g. "2026-09-23/image-021530-ab12cd34.png").
-Users can upload their own images on the server's web page (/upload); list_images shows what is available.
-__TIMING__ If a call returns "Not finished yet" with a job_id, the job keeps running on the server: call
-get_job with that job_id to get the image. Never call the same tool again for that request (it would render the
-image twice). If a call was cut off before you saw a job_id, call get_job without a job_id to find the job.
+# Usage guidance the model sees. Most clients send it with every request, so it stays short. Every tool description
+# has the same shape: what the tool does, when to use it (and when not, with the tool to use instead), one example call
+# (models follow an example better than a description of one), short rules, and what it returns. Each rule is said
+# once. The descriptions are filled in with this server's configured defaults (see _guide), so they stay true when
+# config.yaml changes. Sources: the official Qwen-Image-2.1 settings, community testing, and A/B runs of this server
+# (see the README). Parameter descriptions carry no numbers that depend on the config; the tool description has them.
+# Keep every description under 2,048 characters: some clients cut longer ones, and the job rule is at the end.
+JOB_LINE = ('If it returns "Not finished yet" with a job_id, call get_job with that job_id. Never call this tool again '
+            "to get that image: it would render it twice.")
+IMAGE_INPUT = "this server's link or file path exactly as given (with the date folder), a URL, a data URL or base64"
+EXAMPLE_FILE = "2026-09-23/image-021530-ab12cd34.png"  # a result, as results and list_images give it
+EXAMPLE_UPLOAD = "uploads/2026-09-23/dog-1a2b3c4d.jpg"  # an upload from the /upload page
+EXAMPLE_JOB = "c0ffee123456"
 
-Quality guide:
-- Prompts: detailed and explicit beats short keyword lists. Describe the subject, setting, composition,
-  lighting, colors and medium or camera, and put text to render in double quotes. Never put resolutions,
-  aspect ratios or words like 4K/8K in the prompt; use size and aspect_ratio.
-__SIZE_LINE__
-__STEPS_LINE__
-__CFG_LINE__
-__NEG_LINE__
-- Another version of an earlier image ("one more like it", "same idea without the signs"): call generate_image
-  again with the earlier prompt, changed only as asked, and omit seed. edit_image is for changing a picture.
-- Edits: never reuse the seed that produced the input image; leave seed unset."""
 
-UPSCALE_DESCRIPTION = (
-    "Enlarge an image 2x or 4x with an AI super-resolution model (ESRGAN). It adds real-looking fine detail and "
-    "sharp edges instead of the blur of plain resizing, and keeps the content, composition and colors as they are. "
-    "Use it on finished images (generated, edited or uploaded) when the user wants a bigger or sharper version, for "
-    "print or a wallpaper. The result is at most 8192 px per side: larger inputs are reduced first. Transparency is "
-    "kept. A 360 panorama (for example from generate_panorama) stays a 360 panorama: the wrap-around edges stay "
-    "seamless, the result keeps the Photo Sphere metadata and comes with a 360 viewer link. It takes seconds to "
-    "about a minute, and longer for very large images. If a call returns a job_id, call get_job with it instead of "
-    "calling upscale_image again.")
+def _example(**args) -> str:
+    return "Example: " + json.dumps(args)
+
+
+def _describe(what: str, use: str, example: str, returns: str, avoid: str = "", rules: tuple[str, ...] = (),
+              job: bool = False) -> str:
+    """A tool description in the shape every tool shares (see above)."""
+    return "\n".join([what, f"Use when: {use}", *([f"Not for: {avoid}"] if avoid else []), example, *rules,
+                      f"Returns: {returns}", *([JOB_LINE] if job else [])])
+
 
 AspectRatio = Literal["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16", "21:9", "9:21", "2:1", "1:2", "5:4", "4:5"]
 SizeTier = Literal["small", "medium", "large", "xl"]
 Fmt = Literal["png", "webp", "jpeg"]
-Steps = Annotated[int | None, Field(ge=1, le=100, description=(
-    "Denoising steps. Leave unset: the default in the tool description is the best-quality setting. Use 25-30 "
-    "only when the user asks for a quick draft, and never lower it on your own to save time. Above 50 is slower "
-    "and rarely helps."))]
+Steps = Annotated[int | None, Field(ge=1, le=100, description="Denoising steps. Leave unset.")]
 Size = Annotated[Literal["small", "medium", "large", "xl"] | None, Field(description=(
-    "Resolution tier, i.e. the pixel count (aspect_ratio sets the shape): small ~0.26 MP, medium ~1 MP, large "
-    "~2 MP, xl ~4 MP = native 2K, the sharpest. The tool description says which to use; sizes above the "
-    "server's limit are scaled down."))]
-Guidance = Annotated[float | None, Field(ge=0, le=20, description=(
-    "Guidance scale. Leave unset unless the user asks; the tool description gives this server's default. 3-5 "
-    "gives cleaner, more coherent images that follow the prompt closely and uses the negative prompt; 1 is about "
-    "twice as fast but hazier, follows the prompt less and ignores the negative prompt."))]
+    "Pixel count: small ~0.26 MP, medium ~1 MP, large ~2 MP, xl ~4 MP (native 2K, sharpest). aspect_ratio sets the "
+    "shape. Follow the tool description."))]
+Guidance = Annotated[float | None, Field(ge=0, le=20, description="Guidance scale. Leave unset unless the user asks.")]
 Negative = Annotated[str, Field(description=(
-    "Extra things to avoid, comma-separated (e.g. 'text, signs, watermark'). They are added to the server's "
-    "built-in negative prompt, so leave this empty unless the user wants something specific kept out. Neither "
-    "is used when cfg_scale is 1 or less."))]
+    "Extra things to avoid, comma-separated. Usually leave empty; ignored when cfg_scale is 1 or less."))]
 Seed = Annotated[int | None, Field(description=(
-    "Random seed. Omit it for new images and for variations of an earlier one. Pass an earlier result's seed only "
-    "to reproduce that exact image with the same prompt and settings."))]
-EditSeed = Annotated[int | None, Field(description=(
-    "Leave unset (random). Never pass the seed that produced the input image: re-editing with the same seed "
-    "gives over-saturated, fragmented results."))]
+    "Omit for new images and variations. Pass an earlier seed only to reproduce that exact image."))]
+EditSeed = Annotated[int | None, Field(description="Leave unset. Never pass the seed that produced the input image.")]
 Width = Annotated[int | None, Field(ge=256, le=4096, description=(
-    "Width in pixels, rounded to a multiple of 32. With only width, the height follows aspect_ratio (square if "
-    "unset). Overrides size. Sizes above the server's limit are scaled down."))]
+    "Width in px (multiple of 32); overrides size. Alone, the height follows aspect_ratio."))]
 Height = Annotated[int | None, Field(ge=256, le=4096, description=(
-    "Height in pixels, rounded to a multiple of 32. With only height, the width follows aspect_ratio (square if "
-    "unset). Overrides size. Sizes above the server's limit are scaled down."))]
+    "Height in px (multiple of 32); overrides size. Alone, the width follows aspect_ratio."))]
 EditWidth = Annotated[int | None, Field(ge=256, le=4096, description=(
-    "Output width in pixels, rounded to a multiple of 32. With only width, the height follows aspect_ratio or "
-    "the shape of <image1>. Overrides size. Leave unset to keep the shape of <image1>."))]
+    "Output width in px (multiple of 32); overrides size. Leave unset to keep the shape of <image1>."))]
 EditHeight = Annotated[int | None, Field(ge=256, le=4096, description=(
-    "Output height in pixels, rounded to a multiple of 32. With only height, the width follows aspect_ratio or "
-    "the shape of <image1>. Overrides size. Leave unset to keep the shape of <image1>."))]
-JOB_LINE = ('If the call returns "Not finished yet" with a job_id, the job keeps running on the server: call get_job '
-            "with that job_id. Never call this tool again for the same request: that renders it twice.")
+    "Output height in px (multiple of 32); overrides size. Leave unset to keep the shape of <image1>."))]
+OutputFormat = Annotated[Fmt | None, Field(description="Saved file format (default png).")]
 
 
 def _guide(cfg: Config) -> dict[str, str]:
-    """Tool descriptions with this server's defaults filled in."""
+    """Server instructions and tool descriptions with this server's defaults filled in."""
     g = cfg.generation
     steps = cfg.default_steps
     t2i_cfg = cfg.default_cfg_scale
     cpu = cfg.is_cpu
     max_mp = cfg.max_pixels / 1e6
+    wm = cfg.watermark
 
     def fmt(v: float) -> str:
         return f"{v:g}"
@@ -135,159 +104,193 @@ def _guide(cfg: Config) -> dict[str, str]:
 
     def cfg_line(value: float, edit: bool) -> str:
         if value <= 1:
-            why = ("because this server runs on a CPU, where guidance doubles the time per step" if cpu
-                   else "because this server is configured for speed")
+            why = "because this server runs on a CPU" if cpu else "because this server is configured for speed"
             extra = " For edits consider cfg_scale 4: at 1 the model often ignores the instruction." if edit else ""
-            return (f"- cfg_scale: the default here is {fmt(value)} {why}. 3-5 gives cleaner, more coherent results "
-                    f"and enables the negative prompt, at twice the time per step.{extra}")
-        why = ("edits need guidance: at 1 the model often ignores the instruction and returns a copy of the input"
-               if edit else "3-5 gives cleaner, more coherent images, better text, and uses the negative prompt; "
-               "1 is twice as fast but hazier")
+            return (f"- cfg_scale: leave unset ({fmt(value)} here, {why}); 3-5 is cleaner and enables the negative "
+                    f"prompt but takes twice as long per step.{extra}")
+        why = ("at 1 the model often ignores the instruction and returns a copy" if edit
+               else "1 is twice as fast but hazier")
         return f"- cfg_scale: leave unset ({fmt(value)}, the tested best value; {why})."
 
     def neg_line(built_in: str, value: float) -> str:
         if not built_in:
             return "- negative_prompt: only used when cfg_scale is above 1; then list specific things to avoid."
-        when = ("whenever cfg_scale is above 1 (the default here)" if value > 1
-                else "only when cfg_scale is above 1 (not the default here)")
-        return (f"- negative_prompt: {when}, this built-in list is applied: \"{built_in}\". Pass negative_prompt "
-                "only for specific unwanted things (e.g. \"text, watermark\"); they are added to the list.")
+        if value > 1:
+            return (f'- negative_prompt: the server already applies "{built_in}"; pass extras only when the user '
+                    "wants something kept out.")
+        return (f"- negative_prompt: only used when cfg_scale is above 1 (not the default here); then the server "
+                f'applies "{built_in}".')
 
     rec = g.recommended_size
+    unset_mp = f"about {cfg.default_size[0] * cfg.default_size[1] / 1e6:.1g} MP"
     if not cpu and rec == "large" and max_mp >= 2.0:
-        size_line = ("- size: pass size=\"large\" (about 2 MP) for final images unless the user asks for a quick draft,\n"
-                     "  a preview or speed. \"xl\" (native 2K, about 4 MP) is sharper still but takes several minutes on\n"
-                     "  this server: use it only when the user asks for maximum quality or detail. Leaving size unset\n"
-                     "  gives \"medium\" (about 1 MP), a draft size. size sets the pixel count and aspect_ratio the\n"
-                     "  shape, so combine them (e.g. size=\"large\", aspect_ratio=\"2:3\" for a poster).")
-        instr_size = ("- size: for new images pass size=\"large\" (about 2 MP) unless the user asks for a draft; use \"xl\"\n"
-                      "  (native 2K, several minutes here) only when the user asks for maximum quality.")
-        edit_size = "Leave size unset for normal edits; pass size=\"large\" or \"xl\" only for extra detail (slower)."
+        size_line = ('- size: pass size="large" (about 2 MP) for final images unless the user asks for a draft or '
+                     'speed. "xl" (native 2K, about 4 MP) is sharper but takes several minutes here: use it only when '
+                     'the user asks for maximum quality. Unset gives "medium" (about 1 MP), a draft size.')
+        edit_size = (f'Leave size unset for normal edits ({unset_mp}); pass "large" or "xl" only for extra detail '
+                     "(slower).")
+        example_size = {"size": "large"}
     elif not cpu and rec == "medium":
-        size_line = ("- size: leave size unset (\"medium\", about 1 MP) for normal images; this server's GPU is slower,\n"
-                     "  so larger sizes take several minutes. Pass size=\"large\" (about 2 MP) or \"xl\" (native 2K, the\n"
-                     "  sharpest) only when the user asks for more detail or maximum quality. size sets the pixel\n"
-                     "  count and aspect_ratio the shape, so combine them.")
-        instr_size = ("- size: leave it unset (about 1 MP) for normal images; pass \"large\" or \"xl\" (native 2K) only\n"
-                      "  when the user asks for more detail, since they take several minutes on this server.")
+        size_line = ('- size: leave size unset ("medium", about 1 MP) for normal images; larger sizes take several '
+                     'minutes on this GPU. Pass "large" (about 2 MP) or "xl" (native 2K) only when the user asks for '
+                     "more detail.")
         edit_size = "Leave size unset."
+        example_size = {}
     elif max_mp >= 4.0:
-        size_line = ("- size: pass size=\"xl\" (native 2K, about 4 MP) on every call unless the user asks for a quick\n"
-                     "  draft, a preview or speed. Leaving size unset gives \"medium\" (about 1 MP): about 4x faster but\n"
-                     "  visibly softer. size sets the pixel count and aspect_ratio the shape, so combine them\n"
-                     "  (e.g. size=\"xl\", aspect_ratio=\"2:3\" for a poster).")
-        instr_size = ("- size: for new images pass size=\"xl\" (about 4 MP, the native 2K) unless the user asks for a\n"
-                      "  draft or speed; leaving it unset gives \"medium\" (about 1 MP), a draft size.")
-        edit_size = "For the most detail pass size=\"xl\" (slower); otherwise leave size unset."
+        size_line = ('- size: pass size="xl" (native 2K, about 4 MP) unless the user asks for a draft or speed; '
+                     'unset gives "medium" (about 1 MP), 4x faster but softer.')
+        edit_size = f'For the most detail pass size="xl" (slower); otherwise leave size unset ({unset_mp}).'
+        example_size = {"size": "xl"}
     else:
-        size_line = (f"- size: this server allows at most about {max_mp:.1f} MP. Leave size unset for its default "
-                     f"({cfg.default_size[0]}x{cfg.default_size[1]}); \"medium\" is the largest useful tier and takes "
-                     "several times longer. aspect_ratio sets the shape.")
-        instr_size = f"- size: this server allows at most about {max_mp:.1f} MP; leave size unset unless asked."
+        size_line = (f"- size: this server allows at most about {max_mp:.1f} MP. Leave size unset (default "
+                     f'{cfg.default_size[0]}x{cfg.default_size[1]}); "medium" is the largest useful tier and takes '
+                     "several times longer.")
         edit_size = "Leave size unset."
+        example_size = {}
     if cpu:
-        timing = "Generation takes minutes on this CPU server (many minutes for large images)."
+        timing = "Generation takes minutes on this CPU server."
     elif rec == "xl":
-        timing = ("Generation takes about 30 seconds to a few minutes on a GPU (size \"xl\", edits with several\n"
-                  "inputs and panoramas take longest).")
+        timing = "Generation takes 30 seconds to a few minutes."
     else:
-        timing = ("Generation takes one to several minutes on this server's GPU (larger sizes, edits with several\n"
-                  "inputs and panoramas take longest).")
-    variation = ("- Another version of an earlier image (\"one more like it\", \"same idea again but without the signs\"):\n"
-                 "  call generate_image again with the prompt from your earlier call, changed only as the user asks,\n"
-                 "  and omit seed (never pass the earlier seed). Put newly unwanted things in negative_prompt. Do not\n"
-                 "  use edit_image for this; edit_image changes an existing picture.")
+        timing = "Generation takes one to several minutes."
+    next_tools = ", ".join(["edit_image", *(["upscale_image"] if cfg.upscale.enabled else [])]) + " or remove_background"
 
-    generate = f"""Generate a new image from a text prompt, in any size or aspect ratio, optionally with a transparent background.
+    generate = _describe(
+        "Create a new image from a text prompt.",
+        "the user wants a new picture: any size or aspect ratio, optionally with a transparent background "
+        "(transparent=true) or as a seamless texture (tileable=true).",
+        _example(prompt="A vertical painting of a red fox in a snowy forest at dusk, warm light from a cabin window, "
+                        "soft brushwork", **example_size, aspect_ratio="2:3"),
+        f"the image, its link and its file path; pass the file path to {next_tools} to keep working on it.",
+        avoid="changing an existing image (edit_image) or a 360 panorama (generate_panorama).",
+        rules=(
+            "- prompt: a detailed description, not keywords: subject, setting, composition, lighting, colors and "
+            "medium (photo with camera and lens, painting, 3D render, ...). Put text to render in double quotes. No "
+            "resolutions or 4K/8K words: use size and aspect_ratio.",
+            size_line,
+            steps_line,
+            cfg_line(t2i_cfg, edit=False),
+            neg_line(g.negative_prompt, t2i_cfg),
+            '- Another version of an earlier image ("one more like it"): call generate_image again with your earlier '
+            "prompt, changed only as asked, and omit seed (never pass the earlier seed).",
+        ), job=True)
 
-How to get the best image:
-- prompt: write a detailed, explicit description, not a few keywords. Cover the subject and what it is doing,
-  the setting and background, composition and framing, lighting, colors and mood, and the medium (photo with
-  camera and lens, oil painting, 3D render, flat illustration, ...). Put any text that should appear in the image
-  in double quotes. A good opening is "A wide photograph of ..." or "A vertical poster of ...". Do not write
-  resolutions, aspect ratios or words like 4K/8K/HD in the prompt; use size and aspect_ratio instead.
-{size_line}
-{steps_line}
-{cfg_line(t2i_cfg, edit=False)}
-{neg_line(g.negative_prompt, t2i_cfg)}
-- transparent=true: describe only the subject (e.g. "a red fox sitting, full body, soft studio light"), with no
-  background, backdrop, frame, tile, badge or "app icon" words. The server adds the transparency wording and
-  cleans up the alpha channel.
-- tileable=true: a seamless texture whose opposite edges continue into each other (patterns, wallpapers, game
-  textures). Describe a surface or pattern that fills the whole frame, e.g. "moss-covered cobblestones, top-down".
-  Edits of the result (e.g. a height, normal or roughness map from edit_image) and upscales stay seamless and keep
-  its size automatically: pass the tile's file as the first image.
-- seed: omit it. Pass the seed of an earlier result only to reproduce that exact image with the same prompt.
-{variation}
-{JOB_LINE}"""
+    edit = _describe(
+        "Edit one image or combine up to 10 images.",
+        "the user wants to change an existing picture: add, remove or replace objects or text, change style, "
+        "background, lighting or pose, or merge elements from several images.",
+        _example(prompt="Put the dog from <image2> on the sofa in <image1>, keep everything else unchanged",
+                 images=[EXAMPLE_FILE, EXAMPLE_UPLOAD]),
+        "the edited image, its link and its file path (pass it as <image1> to edit it further).",
+        avoid='another version of an earlier image ("one more like it": call generate_image again with the earlier '
+              "prompt and no seed)"
+              + ("; removing watermarks (remove_watermark)" if wm.enabled else "")
+              + "; only cutting out the subject (remove_background)"
+              + ("; only enlarging (upscale_image)" if cfg.upscale.enabled else "") + ".",
+        rules=(
+            '- prompt: start with the operation ("Replace the ...", "Remove the ...", "Add a ... to ..."), then "keep '
+            'everything else unchanged" (describing the kept parts in detail makes them drift). Put new text in double '
+            "quotes. <image1> is the picture being edited.",
+            "- size: leave aspect_ratio, width and height unset to keep the shape of <image1>; change them only to "
+            f"extend the scene. {edit_size}",
+            steps_line,
+            cfg_line(g.edit_cfg_scale, edit=True),
+            neg_line(g.edit_negative_prompt, g.edit_cfg_scale),
+            "- seed: leave unset. Never reuse the seed that produced the input image: it gives over-saturated, "
+            "fragmented results.",
+        ), job=True)
 
-    wm_hint = (" To remove watermarks, use remove_watermark instead: it is trained for that and changes the rest of "
-               "the image less.") if cfg.watermark.enabled else ""
-    edit = f"""Edit one image or combine several: add, remove or replace objects or text, change style, background, lighting or pose, or merge elements from up to 10 images into one.{wm_hint}
+    pano = _describe(
+        "Create a 360-degree equirectangular panorama (2:1) with Photo Sphere metadata.",
+        "the user wants a 360 view, a VR scene or a spherical panorama, from a prompt or by extending a photo "
+        "(image).",
+        _example(prompt="a misty pine forest at sunrise, a wooden cabin with smoke from the chimney in front, a calm "
+                        "lake behind, tall pines left and right, mossy ground, pale sky, soft golden light"),
+        "the panorama, its link, its file path and a link to an interactive 360 viewer. It takes a minute or more.",
+        avoid='a normal wide image (generate_image with aspect_ratio "21:9").',
+        rules=(
+            "- prompt: describe the scene in every direction: the ground, the horizon, the sky or ceiling, and what is "
+            "in front, left, right and behind. Do not write \"360\", \"panorama\" or \"equirectangular\" (the server "
+            "adds that).",
+            f"- Leave steps, cfg_scale, width and seam_fix unset (defaults here: {steps} steps, "
+            f"{cfg.panorama_size[0]}x{cfg.panorama_size[1]}; the wrap seam is repaired automatically).",
+        ), job=True)
 
-How to get the best result:
-- prompt: start with the operation ("Replace the ...", "Remove the ...", "Add a ... to ...", "Change the style
-  to ..."), then say what must stay the same in one short clause, e.g. "keep everything else unchanged".
-  Describing the parts to keep in detail makes them drift more. Quote any text exactly. Refer to the inputs as
-  <image1>, <image2>, ... and say what each one is for, e.g. "Put the dog from <image2> on the sofa in <image1>".
-  <image1> is the picture being edited.
-- size: leave aspect_ratio, width and height unset so the result keeps the shape of <image1>; a different shape
-  shifts or zooms the content. Change it only to extend the scene (outpainting). {edit_size}
-{steps_line}
-{cfg_line(g.edit_cfg_scale, edit=True)}
-{neg_line(g.edit_negative_prompt, g.edit_cfg_scale)}
-- seed: leave unset. Never reuse the seed that produced the input image: re-editing with the same seed gives
-  over-saturated, fragmented results.
-- mask: for a local change pass a mask image (white = area to change, black = keep). It guides the model (it is
-  sent as an extra reference image with an instruction); it is not a hard pixel mask, so areas outside it can
-  still shift slightly.
-- transparent=true extracts a subject onto a transparent background, e.g. prompt "Extract the logo".
-- images: data URLs, base64, http(s) URLs, or images from this server (earlier results or uploads): pass the full
-  link, or the file path exactly as the result or list_images gave it, including its folder
-  (e.g. "2026-09-23/image-021530-ab12cd34.png"). Large photos are scaled down automatically. If the user says they
-  uploaded an image, call list_images and use the newest uploads/ entry.
-{JOB_LINE}"""
+    background = _describe(
+        "Cut out the main subject of an image onto a transparent background.",
+        "the user wants the background removed from an existing image (a photo, a result or an upload).",
+        _example(image=EXAMPLE_FILE),
+        "a PNG with an alpha channel (WebP if asked), its link and its file path.",
+        avoid="a new image with a transparent background (generate_image with transparent=true).")
 
-    pano = f"""Generate a 360-degree equirectangular panorama (2:1) with Photo Sphere metadata, plus a link to an interactive viewer.
-
-How to get the best result:
-- prompt: describe the whole environment around the viewer in every direction: the ground, the horizon, the sky
-  or ceiling, and what is in front, to the left and right, and behind. Describe only the scene; do not write
-  "360", "panorama" or "equirectangular" (the server adds that). Lighting, time of day, weather and style help.
-- image: optional photo to extend into a full 360 panorama.
-- Leave steps, cfg_scale and width unset (defaults here: {steps} steps, {cfg.panorama_size[0]}x{cfg.panorama_size[1]}).
-  The server repairs the left/right wrap seam automatically.
-{neg_line(g.negative_prompt, t2i_cfg)}
-Panoramas take a minute or more. {JOB_LINE}"""
-
-    if t2i_cfg > 1:
-        instr_cfg = (f"- cfg_scale: leave unset ({fmt(t2i_cfg)} for new images, {fmt(g.edit_cfg_scale)} for edits, "
-                     "the tested best values).")
-    else:
-        instr_cfg = (f"- cfg_scale: new images default to {fmt(t2i_cfg)} here, a speed setting (3-5 is cleaner at "
-                     f"twice the time per step); edits default to {fmt(g.edit_cfg_scale)}.")
-    instr_neg = ("- negative_prompt: a built-in list is applied whenever cfg_scale is above 1; pass only extra, "
-                 "specific things to avoid.")
-    wm = cfg.watermark
     if wm.restore_unchanged:
-        wm_effect = ("the rest of the image stays as it was: only the areas the model changed are replaced, and the "
-                     "result keeps the input's size")
+        wm_effect = "only the areas the model changed are replaced and the rest stays as it was, at the input's size"
     else:
-        wm_effect = (f"the whole image is redrawn at about {fmt(wm.megapixels)} MP (very close to the input) and "
-                     "returned at the input's size")
-    watermark = (f"Remove watermarks from an image: logos, stamps, signatures, copyright lines and semi-transparent or "
-                 f"tiled text laid over the picture. It uses a model trained for this, so {wm_effect}. Call it with "
-                 f"just the image (no prompt needed); it takes about as long as an edit_image call. {JOB_LINE}")
-    wm_line = (f"- remove_watermark: remove watermarks, logos and text stamped over a photo or picture;\n"
-               f"  {wm_effect}.\n") if wm.enabled else ""
-    up_line = ("- upscale_image: enlarge an image 2x or 4x with an AI super-resolution model (sharper detail than plain\n"
-               "  resizing, same content), up to 8192 px per side.\n") if cfg.upscale.enabled else ""
-    instructions = (INSTRUCTIONS.replace("__WATERMARK_LINE__", wm_line).replace("__UPSCALE_LINE__", up_line)
-                    .replace("__TIMING__", timing).replace("__SIZE_LINE__", instr_size)
-                    .replace("__STEPS_LINE__", steps_line).replace("__CFG_LINE__", instr_cfg)
-                    .replace("__NEG_LINE__", instr_neg))
+        wm_effect = f"the whole image is redrawn at about {fmt(wm.megapixels)} MP and returned at the input's size"
+    watermark = _describe(
+        "Remove watermarks from an image: logos, stamps, signatures, copyright lines and overlaid or tiled text.",
+        "the user wants overlaid watermarks, logos or stamped text removed from a picture. It uses a model trained "
+        "for this.",
+        _example(image=EXAMPLE_FILE),
+        f"the cleaned image, its link and its file path: {wm_effect}. It takes about as long as edit_image.",
+        avoid="other changes to the picture (edit_image).", job=True)
+
+    upscale = _describe(
+        "Enlarge an image 2x or 4x with an AI super-resolution model (ESRGAN): sharper detail than plain resizing, "
+        "same content.",
+        "the user wants a bigger or sharper version of a finished image, e.g. for print or a wallpaper.",
+        _example(image=EXAMPLE_FILE, scale=4),
+        "the enlarged image (at most 8192 px per side), its link and its file path. Transparency is kept, and a 360 "
+        "panorama stays a seamless 360 panorama with its viewer link. It takes seconds to a minute.",
+        avoid="changing the content (edit_image).", job=True)
+
+    get_job = _describe(
+        "Get the result of an image job.",
+        'a tool replied "Not finished yet" with a job_id. If a call was cut off before you saw its job_id, call '
+        "get_job without arguments to list the recent jobs.",
+        _example(job_id=EXAMPLE_JOB),
+        "the image(s) as soon as the job is done (it waits a short time first); if the job is still running, its "
+        "status and the next call to make. Results are kept for 24 hours.",
+        avoid="starting a new image: it never starts a render.")
+
+    cancel = _describe(
+        "Cancel an image job.",
+        "the user wants to stop a queued or running job.",
+        _example(job_id=EXAMPLE_JOB),
+        "the job's status. If the job already started, it finishes in the background and the result is discarded.")
+
+    list_images = _describe(
+        "List the recent images on this server, newest first: results, uploads (from the /upload page, under "
+        "uploads/) and inputs-folder files.",
+        "you need an image's file path, e.g. the user uploaded one at /upload (take the newest uploads/ entry).",
+        _example(),
+        "entries with 'file' and 'url'; pass either as an input image to the other tools.")
+
+    view = _describe(
+        "Look at an image stored on this server at full size.",
+        "you need to see an upload or an image not shown in this chat.",
+        _example(image=EXAMPLE_FILE),
+        "the original image with its size and link.",
+        avoid="images attached in the chat (you already see them).")
+
+    status = _describe(
+        "Report the server's state: model, device, download and loading progress, running jobs and default settings.",
+        "a tool says the server is not ready, or the user asks about the server.",
+        _example(),
+        'the state ("starting", "downloading", "loading", "ready" or "error") and the details.')
+
+    instructions = "\n".join([
+        "Local image generation and editing with Qwen-Image-2.1.",
+        "Input images: this server's link or file path exactly as a result or list_images gave it, with its date "
+        'folder (e.g. "2026-09-23/image-021530-ab12cd34.png"), or a URL, data URL or base64. If the user says they '
+        "uploaded an image (at /upload), call list_images and use the newest uploads/ entry.",
+        f'{timing} If a call returns "Not finished yet", call get_job with its job_id; never call the same tool again '
+        "to get that image (it would render it twice). If a call was cut off before you saw a job_id, call "
+        "get_job with no arguments.",
+    ])
     return {"instructions": instructions, "generate": generate, "edit": edit, "panorama": pano,
-            "watermark": watermark}
+            "background": background, "watermark": watermark, "upscale": upscale, "get_job": get_job,
+            "cancel_job": cancel, "list_images": list_images, "view_image": view, "server_status": status}
 
 
 # Optional request headers (e.g. injected by an MCP bridge) that adapt results to a client.
@@ -662,19 +665,19 @@ def create_server(service: ImageService) -> MCPServer:
               meta=UI_META, annotations=ToolAnnotations(title="Generate image", readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=False, openWorldHint=False))
     async def generate_image(
-        prompt: Annotated[str, Field(description="Detailed description of the image: subject, setting, composition, lighting, colors, and medium or camera; text to render in double quotes. No resolutions or '4K' words.")],
+        prompt: Annotated[str, Field(description="Detailed description of the image; text to render in double quotes.")],
         ctx: Context,
         aspect_ratio: Annotated[AspectRatio | None, Field(description="Aspect ratio, e.g. 16:9. Ignored when both width and height are given.")] = None,
         size: Size = None,
         width: Width = None,
         height: Height = None,
-        transparent: Annotated[bool, Field(description="Transparent background: returns a PNG/WebP with an alpha channel. Describe only the subject in the prompt, with no background, tile or badge words.")] = False,
-        tileable: Annotated[bool, Field(description="Seamless tiling texture: the left and right edges and the top and bottom edges continue into each other, so the image repeats without visible seams (patterns, wallpapers, game textures). Generated in one pass with wrap-around edges, so it takes no longer than a normal image. Cannot be combined with transparent.")] = False,
+        transparent: Annotated[bool, Field(description="Transparent background (alpha channel). Describe only the subject, with no background, frame, badge or 'app icon' words.")] = False,
+        tileable: Annotated[bool, Field(description="Seamless repeating texture: describe a surface that fills the frame. Edits and upscales of it stay seamless when its file is passed first. Not with transparent.")] = False,
         negative_prompt: Negative = "",
         steps: Steps = None,
         cfg_scale: Guidance = None,
         seed: Seed = None,
-        output_format: Annotated[Fmt | None, Field(description="File format of the saved image (png default).")] = None,
+        output_format: OutputFormat = None,
     ) -> CallToolResult:
         args = dict(prompt=prompt, negative_prompt=negative_prompt, width=width, height=height,
                     aspect_ratio=aspect_ratio, size=size, transparent=transparent, steps=steps, cfg_scale=cfg_scale,
@@ -686,21 +689,21 @@ def create_server(service: ImageService) -> MCPServer:
               meta=UI_META, annotations=ToolAnnotations(title="Edit or combine images", readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=False, openWorldHint=True))
     async def edit_image(
-        prompt: Annotated[str, Field(description="The edit instruction: start with the operation, then 'keep everything else unchanged'. Refer to inputs as <image1>, <image2>, ... e.g. 'Put the cat from <image2> on the sofa in <image1>, keep everything else unchanged', 'Remove the people in the background', 'Change the style to a watercolor painting'.")],
-        images: Annotated[list[str], Field(min_length=1, max_length=10, description="1-10 input images: data URLs, base64, http(s) URLs, or this server's links or file paths exactly as given (with the date folder). The first image is the one being edited and sets the output shape.")],
+        prompt: Annotated[str, Field(description="The edit instruction: the operation, then 'keep everything else unchanged'. Refer to inputs as <image1>, <image2>, ...")],
+        images: Annotated[list[str], Field(min_length=1, max_length=10, description=f"1-10 input images: {IMAGE_INPUT}. The first is the one edited and sets the output shape.")],
         ctx: Context,
-        mask: Annotated[str | None, Field(description="Optional mask image: white = area to change, black = keep (transparent pixels count as black). It is sent to the model as an extra reference image and the prompt is extended to change only the white area, so it guides the edit but does not lock the black area pixel for pixel. Counts as one of the 10 inputs.")] = None,
+        mask: Annotated[str | None, Field(description="Optional mask image: white = change, black = keep (transparent counts as black). A guide, not a hard pixel mask: areas outside it can shift slightly. Counts as one of the 10 inputs.")] = None,
         aspect_ratio: Annotated[AspectRatio | None, Field(description="Output aspect ratio (default: same as the first image).")] = None,
         size: Size = None,
         width: EditWidth = None,
         height: EditHeight = None,
-        transparent: Annotated[bool, Field(description="Produce a transparent background (e.g. 'extract the logo').")] = False,
+        transparent: Annotated[bool, Field(description="Put the edited result on a transparent background (prompt e.g. 'Extract the logo from the shirt').")] = False,
         negative_prompt: Negative = "",
         steps: Steps = None,
         cfg_scale: Guidance = None,
         seed: EditSeed = None,
-        output_format: Annotated[Fmt | None, Field(description="File format of the saved image (png default).")] = None,
-        tileable: Annotated[bool | None, Field(description="Leave unset: when the first image is a seamless tile made by this server (generate_image tileable=true, or an earlier tileable edit or upscale), the edit keeps it seamless and at the same size, e.g. for height, normal or roughness maps of a texture. true: treat the first image as a seamless tile (e.g. a texture from elsewhere). false: a normal edit.")] = None,
+        output_format: OutputFormat = None,
+        tileable: Annotated[bool | None, Field(description="Leave unset: a tile from this server passed as <image1> is detected and stays seamless at the same size (e.g. for height or normal maps). true: treat <image1> as a tile from elsewhere. false: a normal edit.")] = None,
     ) -> CallToolResult:
         args = dict(prompt=prompt, images=images, mask=mask, negative_prompt=negative_prompt, width=width,
                     height=height, aspect_ratio=aspect_ratio, size=size, transparent=transparent, steps=steps,
@@ -713,11 +716,11 @@ def create_server(service: ImageService) -> MCPServer:
               meta=UI_META, annotations=ToolAnnotations(title="Generate 360 panorama", readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=False, openWorldHint=True))
     async def generate_panorama(
-        prompt: Annotated[str, Field(description="The scene only, in every direction: the ground, the horizon, the sky or ceiling, and what is in front, to the left and right, and behind the viewer, e.g. 'a misty pine forest at sunrise, a wooden cabin with smoke from the chimney in front, a lake behind, mossy ground'. Do not write '360', 'panorama' or 'equirectangular'; the server adds that.")],
+        prompt: Annotated[str, Field(description="The scene only, in every direction. No '360' or 'panorama' words.")],
         ctx: Context,
         image: Annotated[str | None, Field(description="Optional photo to extend into a full 360 panorama.")] = None,
-        width: Annotated[int | None, Field(ge=512, le=4096, description="Panorama width, rounded to a multiple of 64; the height is exactly width/2 (equirectangular). Leave unset for the tested default; sizes above the server's limit are scaled down.")] = None,
-        seam_fix: Annotated[bool | None, Field(description="Repair the left/right wrap seam with a second masked pass (default on).")] = None,
+        width: Annotated[int | None, Field(ge=512, le=4096, description="Width, rounded to a multiple of 64; height = width/2. Leave unset.")] = None,
+        seam_fix: Annotated[bool | None, Field(description="Repair the left/right wrap seam (default on).")] = None,
         negative_prompt: Negative = "",
         steps: Steps = None,
         cfg_scale: Guidance = None,
@@ -729,14 +732,14 @@ def create_server(service: ImageService) -> MCPServer:
         return await _start("panorama", lambda progress: service.panorama(**args, progress=progress), ctx, args,
             f"width={width} from_image={image is not None} seam_fix={seam_fix} steps={steps}")
 
-    @mcp.tool(meta=UI_META, annotations=ToolAnnotations(title="Remove background", readOnlyHint=False, destructiveHint=False,
+    @mcp.tool(description=guide["background"],
+              meta=UI_META, annotations=ToolAnnotations(title="Remove background", readOnlyHint=False, destructiveHint=False,
                                           idempotentHint=True, openWorldHint=True))
     async def remove_background(
-        image: Annotated[str, Field(description="Image to cut out: data URL, base64, http(s) URL, or this server's link or file path exactly as given (with the date folder).")],
+        image: Annotated[str, Field(description=f"Image to cut out: {IMAGE_INPUT}.")],
         ctx: Context,
         output_format: Annotated[Literal["png", "webp"], Field(description="png (default) or webp; both keep the alpha channel.")] = "png",
     ) -> CallToolResult:
-        """Remove the background of an image and return the subject with a transparent background (PNG by default)."""
         if service.matter is None:
             return _error("background removal is not available yet (models are still loading) or it is disabled "
                           "(transparency.method is 'native')")
@@ -749,26 +752,26 @@ def create_server(service: ImageService) -> MCPServer:
                   meta=UI_META, annotations=ToolAnnotations(title="Remove watermarks", readOnlyHint=False, destructiveHint=False,
                                               idempotentHint=False, openWorldHint=True))
         async def remove_watermark(
-            image: Annotated[str, Field(description="Image to clean: data URL, base64, http(s) URL, or this server's link or file path exactly as given (with the date folder).")],
+            image: Annotated[str, Field(description=f"Image to clean: {IMAGE_INPUT}.")],
             ctx: Context,
             seed: EditSeed = None,
-            output_format: Annotated[Fmt | None, Field(description="File format of the saved image (png default).")] = None,
+            output_format: OutputFormat = None,
         ) -> CallToolResult:
             args = dict(image=image, seed=seed, output_format=output_format)
             return await _start("remove_watermark", lambda progress: service.remove_watermark(**args, progress=progress),
                                 ctx, args)
 
     if cfg.upscale.enabled:
-        @mcp.tool(description=UPSCALE_DESCRIPTION,
+        @mcp.tool(description=guide["upscale"],
                   meta=UI_META, annotations=ToolAnnotations(title="Upscale image", readOnlyHint=False, destructiveHint=False,
                                               idempotentHint=True, openWorldHint=True))
         async def upscale_image(
-            image: Annotated[str, Field(description="Image to enlarge: data URL, base64, http(s) URL, or this server's link or file path exactly as given (with the date folder).")],
+            image: Annotated[str, Field(description=f"Image to enlarge: {IMAGE_INPUT}.")],
             ctx: Context,
             scale: Annotated[Literal[2, 4], Field(description="Enlargement factor: 4 (default) or 2.")] = 4,
-            output_format: Annotated[Fmt | None, Field(description="File format of the saved image (png default, jpeg for 360 panoramas; jpeg is much smaller for very large results).")] = None,
-            panorama: Annotated[bool | None, Field(description="Leave unset: images tagged as 360 panoramas (Photo Sphere metadata, as generate_panorama makes them) are detected. true: treat a 2:1 image without that tag as a 360 panorama. false: plain upscale.")] = None,
-            tileable: Annotated[bool | None, Field(description="Leave unset: seamless tiles made by this server are detected and stay seamless (both directions wrap). true: treat the image as a seamless tile (e.g. a texture from elsewhere). false: plain upscale.")] = None,
+            output_format: Annotated[Fmt | None, Field(description="Saved file format (default png; jpeg for 360 panoramas, much smaller for very large results).")] = None,
+            panorama: Annotated[bool | None, Field(description="Leave unset (360 panoramas are detected). true: treat a 2:1 image as one. false: plain upscale.")] = None,
+            tileable: Annotated[bool | None, Field(description="Leave unset (this server's seamless tiles are detected). true: treat it as a tile. false: plain upscale.")] = None,
         ) -> CallToolResult:
             args = dict(image=image, scale=scale, output_format=output_format, as_panorama=panorama,
                         as_tileable=tileable)
@@ -777,16 +780,14 @@ def create_server(service: ImageService) -> MCPServer:
                 + (f" panorama={panorama}" if panorama is not None else "")
                 + (f" tileable={tileable}" if tileable is not None else ""))
 
-    @mcp.tool(annotations=ToolAnnotations(title="Get job result", readOnlyHint=True, openWorldHint=False))
+    @mcp.tool(description=guide["get_job"],
+              annotations=ToolAnnotations(title="Get job result", readOnlyHint=True, openWorldHint=False))
     async def get_job(
         ctx: Context,
-        job_id: Annotated[str | None, Field(description="The job_id from a reply that said 'Not finished yet'. Leave out job_id and job_ids to list the jobs of the last 30 minutes (e.g. when a call was cut off before you saw its job_id).")] = None,
-        job_ids: Annotated[list[str] | None, Field(max_length=20, description="Several job_ids at once: returns every finished image and the status of the others.")] = None,
-        poll: Annotated[int | None, Field(description="Optional counter: pass the value from the last reply's next step. The server ignores it.")] = None,
+        job_id: Annotated[str | None, Field(description="The job_id from a 'Not finished yet' reply. Omit job_id and job_ids to list the jobs of the last 30 minutes.")] = None,
+        job_ids: Annotated[list[str] | None, Field(max_length=20, description="Several job_ids at once.")] = None,
+        poll: Annotated[int | None, Field(description="Optional counter from the last reply's next step.")] = None,
     ) -> CallToolResult:
-        """Get the image(s) of a job that was not finished when its tool call returned. Waits a short time and returns
-        as soon as the job is done; if it is still running, the reply gives its status and the next call to make.
-        Results are kept for 24 hours. Calling this never starts a new render."""
         ids = list(dict.fromkeys(i.strip() for i in [*([job_id] if job_id else []), *(job_ids or [])] if i.strip()))
         if not ids:
             recent = service.jobs.recent()
@@ -841,31 +842,31 @@ def create_server(service: ImageService) -> MCPServer:
             structured.update(next=p.structured_content["next"], next_step=p.structured_content["next_step"])
         return CallToolResult(content=content, structured_content=structured)
 
-    @mcp.tool(annotations=ToolAnnotations(title="Cancel job", readOnlyHint=False, destructiveHint=True,
+    @mcp.tool(description=guide["cancel_job"],
+              annotations=ToolAnnotations(title="Cancel job", readOnlyHint=False, destructiveHint=True,
                                           idempotentHint=True, openWorldHint=False))
-    async def cancel_job(job_id: Annotated[str, Field(description="The job to cancel.")]) -> dict:
-        """Cancel a job. If the engine already started it, it finishes in the background but the result is discarded."""
+    async def cancel_job(job_id: Annotated[str, Field(description="The job_id from a reply, or from get_job with no arguments.")]) -> dict:
         job = service.jobs.cancel(job_id)
         if job is None:
             return {"error": f"unknown job_id {job_id!r}"}
         await asyncio.sleep(0)
         return job.summary()
 
-    @mcp.tool(annotations=ToolAnnotations(title="List images", readOnlyHint=True, openWorldHint=False))
+    @mcp.tool(description=guide["list_images"],
+              annotations=ToolAnnotations(title="List images", readOnlyHint=True, openWorldHint=False))
     async def list_images(
         ctx: Context,
-        limit: Annotated[int, Field(ge=1, le=200, description="Maximum number of entries in the combined results-and-uploads list (and in the inputs folder list).")] = 30,
+        limit: Annotated[int, Field(ge=1, le=200, description="Maximum entries (results and uploads share the list).")] = 30,
     ) -> dict:
-        """List recent generated and uploaded images (and files in the inputs folder) that can be used as inputs by their 'file' path or 'url'. Users upload images on this server's /upload page; uploads appear under uploads/. Results and uploads share one list of `limit` entries, newest first."""
         _remember_base_url(ctx)
         return service.list_images(limit)
 
-    @mcp.tool(annotations=ToolAnnotations(title="View image", readOnlyHint=True, openWorldHint=False))
+    @mcp.tool(description=guide["view_image"],
+              annotations=ToolAnnotations(title="View image", readOnlyHint=True, openWorldHint=False))
     async def view_image(
-        image: Annotated[str, Field(description="An image on this server: the file path or link from a result or list_images (e.g. '2026-09-23/image-021530-ab12cd34.png'), or its bare file name.")],
+        image: Annotated[str, Field(description="File path or link from a result or list_images, or its bare file name.")],
         ctx: Context,
     ) -> CallToolResult:
-        """Look at an image stored on this server at its original size and resolution, e.g. to check a result or an upload before editing it. Returns the original file (PNG or JPEG as saved; other formats as PNG) plus its size and link. Use list_images to find file names. Images attached in the chat are not on this server: use the chat's own handle for those."""
         _remember_base_url(ctx)
         path = await asyncio.to_thread(service.loader.local_path, image)
         if path is None:
@@ -903,9 +904,9 @@ def create_server(service: ImageService) -> MCPServer:
         return CallToolResult(content=[ImageContent(type="image", data=base64.b64encode(data).decode(), mimeType=mime),
                                        TextContent(type="text", text=text)], structured_content=info)
 
-    @mcp.tool(annotations=ToolAnnotations(title="Server status", readOnlyHint=True, openWorldHint=False))
+    @mcp.tool(description=guide["server_status"],
+              annotations=ToolAnnotations(title="Server status", readOnlyHint=True, openWorldHint=False))
     async def server_status() -> dict:
-        """Report model, device placement, download/loading progress, running jobs and default settings."""
         st = service.status()
         st["running_jobs"] = [j.summary() for j in service.jobs.jobs.values() if j.status == "running"]
         return st

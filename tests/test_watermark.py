@@ -169,8 +169,8 @@ async def test_remove_watermark_tool_follows_the_config(tmp_path):
     on_tools = {t.name: t for t in await on.list_tools()}
     assert "remove_watermark" in on_tools
     assert "remove_watermark" not in {t.name for t in await off.list_tools()}
-    assert "remove_watermark" in on.instructions and "remove_watermark" not in off.instructions
-    assert "watermarks, use remove_watermark" in on_tools["edit_image"].description
+    assert "(remove_watermark)" in on_tools["edit_image"].description
+    assert "remove_watermark" not in {t.name: t for t in await off.list_tools()}["edit_image"].description
 
 
 async def test_remove_watermark_keeps_the_color_profile(tmp_path):

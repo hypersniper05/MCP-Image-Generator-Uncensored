@@ -289,14 +289,28 @@ async def test_tool_descriptions_carry_the_configured_guidance(tmp_path):
     edit = tools["edit_image"].description
     assert "keep everything else unchanged" in edit and "Never reuse the seed" in edit
     assert "every direction" in tools["generate_panorama"].description
-    assert "__" not in mcp.instructions and "3.5 for new images" in mcp.instructions
-    assert "added to" in tools["generate_image"].input_schema["properties"]["negative_prompt"]["description"]
+    assert "__" not in mcp.instructions and "date folder" in mcp.instructions and "get_job" in mcp.instructions
+    assert 'Example: {"prompt": ' in gen and '"size": "xl"' in gen and "<image2>" in edit  # one example call each
+    assert 'the server already applies "blurry, low quality"' in gen
+    assert "ignored when cfg_scale is 1" in tools["generate_image"].input_schema["properties"]["negative_prompt"]["description"]
     cpu = create_server(StubService(Config.model_validate({"device": "cpu", "outputs_dir": str(tmp_path),
                                                             "models_dir": str(tmp_path / "m")}), tmp_path))
     cpu_gen = {t.name: t for t in await cpu.list_tools()}["generate_image"].description
-    assert "the default here is 1 because this server runs on a CPU" in cpu_gen
+    assert "leave unset (1 here, because this server runs on a CPU)" in cpu_gen
     assert "lowered for CPU speed; the official setting is 40" in cpu_gen and 'pass size="xl"' not in cpu_gen
-    assert "not a hard pixel mask" in tools["edit_image"].description
+    assert "not a hard pixel mask" in tools["edit_image"].input_schema["properties"]["mask"]["description"]
+    assert all(len(t.description) < 2048 for t in tools.values())  # some clients cut longer descriptions
+    for t in tools.values():  # every tool: when to use it, one example call, what it returns
+        if t.name != "job_status":  # used only by the in-chat viewer
+            assert all(k in t.description for k in ("Use when: ", "Example: {", "Returns: ")), t.name
+
+
+async def test_descriptions_stay_under_client_limits(tmp_path):
+    # some clients cut tool descriptions at 2,048 characters, and the job rule is at the end
+    for gen in ({}, {"recommended_size": "large", "edit_cfg_scale": 1.0, "cfg_scale": 1.0}, {"recommended_size": "medium"}):
+        cfg = Config.model_validate({"outputs_dir": str(tmp_path), "models_dir": str(tmp_path / "m"), "generation": gen})
+        for t in await create_server(StubService(cfg, tmp_path)).list_tools():
+            assert len(t.description) < 2048, (gen, t.name, len(t.description))
 
 
 def test_negative_prompt_merging():

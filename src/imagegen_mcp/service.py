@@ -974,8 +974,8 @@ class ImageService:
         return {
             "outputs_and_uploads": entries(self.outputs, "", f"{self.base_url()}/outputs"),
             "inputs_folder": entries(Path("/inputs"), "", None),
-            "how_to_use": "Pass the 'file' or 'url' value of an entry as an image to edit_image, generate_panorama "
-                          "or remove_background. Upload new images at " + self.base_url() + "/upload",
+            "how_to_use": "Pass the 'file' or 'url' value of an entry as an image to any tool. Upload new images at "
+                          + self.base_url() + "/upload",
         }
 
     # ------------------------------------------------------------ status
